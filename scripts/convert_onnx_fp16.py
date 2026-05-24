@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Convert ONNX model weights from fp32 to fp16.
+"""Convert ONNX model to fp16 using onnxconverter-common.
+
+Handles type compatibility properly (inserts Cast nodes where needed).
 
 Usage: python convert_onnx_fp16.py <input.onnx> <output.onnx>
 """
@@ -7,8 +9,7 @@ Usage: python convert_onnx_fp16.py <input.onnx> <output.onnx>
 import sys
 import os
 import onnx
-from onnx import TensorProto, numpy_helper
-import numpy as np
+from onnxconverter_common import float16
 
 
 def main():
@@ -17,32 +18,23 @@ def main():
         sys.exit(1)
 
     inp, out = sys.argv[1], sys.argv[2]
-
     if not os.path.exists(inp):
         print(f"MISSING: {inp}")
         sys.exit(1)
 
-    print(f"Input: {inp} ({os.path.getsize(inp) / 1024 / 1024:.1f} MB)")
+    in_sz = os.path.getsize(inp)
+    print(f"Input: {inp} ({in_sz / 1024 / 1024:.1f} MB)")
 
     model = onnx.load(inp)
+    model_fp16 = float16.convert_float_to_float16(
+        model,
+        keep_io_types=True,
+        disable_shape_infer=False,
+    )
+    onnx.save(model_fp16, out)
 
-    converted = 0
-    skipped = 0
-    for init in model.graph.initializer:
-        if init.data_type == TensorProto.FLOAT:
-            arr = numpy_helper.to_array(init)
-            arr16 = arr.astype(np.float16)
-            init.CopyFrom(numpy_helper.from_array(arr16, init.name))
-            converted += 1
-        else:
-            skipped += 1
-
-    onnx.save(model, out)
-
-    in_sz = os.path.getsize(inp)
     out_sz = os.path.getsize(out)
     pct = (1 - out_sz / in_sz) * 100 if in_sz > 0 else 0
-    print(f"Converted: {converted} tensors to fp16, {skipped} skipped")
     print(f"Output: {out} ({out_sz / 1024 / 1024:.1f} MB, -{pct:.0f}%)")
 
 
