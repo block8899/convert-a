@@ -152,7 +152,7 @@ class BiSeNet(nn.Module):
         self.cp = ContextPath()
         self.sp = SpatialPath()
         self.ffm = FeatureFusionModule(256, 256)
-        self.conv_out = BiSeNetOutput(256, 64, n_classes)
+        self.conv_out = BiSeNetOutput(256, 256, n_classes)
 
     def forward(self, x):
         feat_sp = self.sp(x)
