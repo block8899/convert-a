@@ -2,11 +2,11 @@
 name: Convert Models to NCNN
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   convert:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -15,46 +15,45 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Setup Swap
         run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install onnxsim onnx gdown onnxscript
-          # Download ncnn tools (pre-built binaries)
-          wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu.zip
-          unzip -q ncnn-20240820-ubuntu.zip
-          echo "$PWD/ncnn-20240820-ubuntu/bin" >> $GITHUB_PATH
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile 2>/dev/null || true
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
 
-      - name: Verify ncnn tools
+      - name: Install Dependencies
         run: |
-          onnx2ncnn 2>&1 || true
-          echo "onnx2ncnn path: $(which onnx2ncnn)"
+          pip install --upgrade pip
+          pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu \
+            --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir pnnx onnxsim onnx gdown onnxscript
+
       - name: Clone BiSeNet repo
         run: |
           git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
 
-      - name: Download weights from Google Drive
+      - name: Download weights
         run: |
-          # BiSeNet (.pth)
           gdown "1D7SK1aFzQ30ZEd-Q0L7I5xBjRKMnvmZL" -O repo_bisenet/79999_iter.pth
-          # AnimeGANv3 (.onnx)
           gdown "1e868B_Siu9XQNAF9fCeyD0Nf0PYOpQxv" -O AnimeGANv3_PortraitSketch_25.onnx
-          # Verify
           ls -lh repo_bisenet/79999_iter.pth
           ls -lh AnimeGANv3_PortraitSketch_25.onnx
 
-      - name: Convert BiSeNet (pth → PNNX → NCNN)
+      - name: Convert BiSeNet
+        timeout-minutes: 30
         run: python scripts/convert_bisenet.py
 
-      - name: Convert AnimeGANv3 (ONNX → NCNN)
+      - name: Convert AnimeGANv3
+        timeout-minutes: 30
         run: python scripts/convert_animegan.py
 
       - name: Verify outputs
         run: |
-          echo "=== Output files ==="
+          echo "=== Output ==="
           ls -lh output/
-          echo ""
-          echo "=== Total size ==="
-          du -sh output/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
