@@ -1,3 +1,4 @@
+# .github/workflows/convert_models.yml
 name: Convert Models to NCNN
 
 on:
@@ -28,8 +29,13 @@ jobs:
           pip install --upgrade pip
           pip install torch==2.1.0+cpu torchvision==0.16.0+cpu \
             --index-url https://download.pytorch.org/whl/cpu
-          pip install onnxsim onnx gdown numpy
+          pip install onnxsim onnx gdown onnxscript
           pip install pnnx
+
+      - name: Verify PNNX
+        run: |
+          which pnnx
+          pnnx --help 2>&1 | head -5 || true
 
       - name: Clone BiSeNet repo
         run: git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
@@ -49,20 +55,7 @@ jobs:
         run: python scripts/convert_animegan.py
 
       - name: Verify
-        run: |
-          echo "=== All output files ==="
-          ls -lh output/
-          echo ""
-          echo "=== Size comparison ==="
-          for model in animegan biSeNet; do
-            fp32="output/${model}.bin"
-            fp16="output/${model}_fp16.bin"
-            if [ -f "$fp32" ] && [ -f "$fp16" ]; then
-              s32=$(stat -c%s "$fp32")
-              s16=$(stat -c%s "$fp16")
-              echo "$model: fp32=$(numfmt --to=iec $s32) -> fp16=$(numfmt --to=iec $s16) ($(( 100 - s16 * 100 / s32 ))% smaller)"
-            fi
-          done
+        run: ls -lh output/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
