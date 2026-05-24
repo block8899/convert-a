@@ -2,16 +2,12 @@
 
 import torch
 import torch.nn as nn
-import pnnx
 import os
 import sys
 import shutil
+import subprocess
 import gc
 
-
-# ═══════════════════════════════════════════════════
-# Wrapper — chỉ lấy output chính cho NCNN
-# ═══════════════════════════════════════════════════
 
 class BiSeNetWrapper(nn.Module):
     def __init__(self, model):
@@ -20,14 +16,13 @@ class BiSeNetWrapper(nn.Module):
 
     def forward(self, x):
         out = self.model(x)
-        # Repo trả về tuple (main, aux1, aux2) hoặc list
         if isinstance(out, (tuple, list)):
-            return out[0]  # Chỉ lấy output chính
+            return out[0]
         return out
 
 
 def main():
-    print("=== BiSeNet → NCNN ===\n")
+    print("=== BiSeNet → NCNN (via ONNX) ===\n")
 
     # 1. Import từ repo
     sys.path.insert(0, 'repo_bisenet')
@@ -36,16 +31,12 @@ def main():
         print("Imported BiSeNet from repo_bisenet/model.py")
     except ImportError as e:
         print(f"Cannot import: {e}")
-        print("Available files:")
-        for f in os.listdir('repo_bisenet'):
-            print(f"  {f}")
         sys.exit(1)
 
-    # 2. Create + wrap
+    # 2. Create + load
     model = BiSeNet(n_classes=19)
     model.eval()
 
-    # 3. Load weights
     weight_path = "repo_bisenet/79999_iter.pth"
     if not os.path.exists(weight_path):
         print(f"MISSING: {weight_path}")
@@ -66,60 +57,87 @@ def main():
         print(f"Load error: {e}")
         sys.exit(1)
 
-    # 4. Wrap — chỉ lấy output chính
+    # 3. Wrap
     wrapper = BiSeNetWrapper(model)
     wrapper.eval()
 
     params = sum(p.numel() for p in wrapper.parameters())
     print(f"Parameters: {params:,} ({params * 4 / 1024 / 1024:.1f} MB)")
 
-    # 5. Test forward
+    # 4. Test forward
     torch.set_grad_enabled(False)
     dummy = torch.randn(1, 3, 512, 512)
 
     print("\nTesting forward pass...")
-    try:
-        with torch.no_grad():
-            out = wrapper(dummy)
-        print(f"  Forward OK: input={list(dummy.shape)} → output={list(out.shape)}")
-    except Exception as e:
-        print(f"  Forward failed: {e}")
-        # Debug: show raw output type
-        try:
-            raw = model(dummy)
-            print(f"  Raw output type: {type(raw)}")
-            if isinstance(raw, (tuple, list)):
-                for i, r in enumerate(raw):
-                    if isinstance(r, torch.Tensor):
-                        print(f"    [{i}]: {list(r.shape)}")
-                    else:
-                        print(f"    [{i}]: {type(r)}")
-        except Exception as e2:
-            print(f"  Raw forward also failed: {e2}")
-        sys.exit(1)
+    with torch.no_grad():
+        out = wrapper(dummy)
+    print(f"  Forward OK: {list(dummy.shape)} → {list(out.shape)}")
 
-    # 6. PNNX export
-    print("\nConverting via PNNX...")
-    try:
-        pnnx.export(wrapper, "bisenet", inputs=dummy)
-        print("  PNNX export done!")
-    except Exception as e:
-        print(f"  PNNX failed: {e}")
-        sys.exit(1)
+    # 5. Export to ONNX
+    print("\nExporting to ONNX...")
+    onnx_file = "bisenet.onnx"
+    torch.onnx.export(
+        wrapper,
+        dummy,
+        onnx_file,
+        input_names=["input"],
+        output_names=["output"],
+        opset_version=11,
+        dynamic_axes=None,
+    )
+    print(f"  ONNX: {os.path.getsize(onnx_file) / 1024 / 1024:.1f} MB")
 
     del wrapper, model, dummy
     gc.collect()
 
-    # 7. Move outputs
+    # 6. Simplify ONNX
+    print("\nSimplifying ONNX...")
+    sim_file = "bisenet_sim.onnx"
+    ret = subprocess.run(
+        [sys.executable, "-m", "onnxsim", onnx_file, sim_file],
+        capture_output=True, text=True,
+    )
+    if ret.returncode != 0:
+        print(f"  onnxsim failed: {ret.stderr}")
+        print("  Using original ONNX")
+        sim_file = onnx_file
+    else:
+        print(f"  Simplified: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
+
+    # 7. onnx2ncnn
+    print("\nConverting to NCNN...")
     os.makedirs("output", exist_ok=True)
-    for suffix in [".ncnn.param", ".ncnn.bin"]:
-        src = f"bisenet{suffix}"
-        dst = f"output/biSeNet{suffix}"
-        if os.path.exists(src):
-            shutil.move(src, dst)
-            print(f"  {dst}: {os.path.getsize(dst) / 1024:.1f} KB")
+
+    param_file = "output/biSeNet.param"
+    bin_file = "output/biSeNet.bin"
+
+    # Find onnx2ncnn
+    onnx2ncnn = shutil.which("onnx2ncnn")
+    if not onnx2ncnn:
+        onnx2ncnn = "onnx2ncnn"
+
+    ret = subprocess.run(
+        [onnx2ncnn, sim_file, param_file, bin_file],
+        capture_output=True, text=True,
+    )
+
+    if ret.returncode != 0:
+        print(f"  onnx2ncnn error: {ret.stderr}")
+        if ret.stdout:
+            print(f"  stdout: {ret.stdout}")
+        sys.exit(1)
+
+    # 8. Verify
+    print("\nOutput:")
+    for f in [param_file, bin_file]:
+        if os.path.exists(f):
+            size = os.path.getsize(f)
+            if size > 1024 * 1024:
+                print(f"  {f}: {size / 1024 / 1024:.1f} MB")
+            else:
+                print(f"  {f}: {size / 1024:.1f} KB")
         else:
-            print(f"  MISSING: {src}")
+            print(f"  MISSING: {f}")
             sys.exit(1)
 
     print("\nBiSeNet conversion OK!")
