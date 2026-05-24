@@ -6,7 +6,6 @@ import subprocess
 import shutil
 
 
-# ncnnoptimize flag: 1=fp16p | 2=fp16s | 4=fp16a | 65536=strip
 FP16_FLAG = "65539"
 
 
