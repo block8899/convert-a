@@ -49,13 +49,34 @@ jobs:
                 -DNCNN_BUILD_EXAMPLES=OFF \
                 -DNCNN_BUILD_BENCHMARK=OFF ..
           make -j$(nproc)
-          sudo cp tools/onnx2ncnn /usr/local/bin/ 2>/dev/null || \
-            sudo find . -name 'onnx2ncnn' -executable -exec cp {} /usr/local/bin/ \;
-          sudo cp tools/ncnnoptimize /usr/local/bin/ 2>/dev/null || \
-            sudo find . -name 'ncnnoptimize' -executable -exec cp {} /usr/local/bin/ \;
+
+          # Find and install onnx2ncnn
+          ONNX2NCNN=$(find . -name 'onnx2ncnn' -type f | head -1)
+          if [ -z "$ONNX2NCNN" ]; then
+            echo "ERROR: onnx2ncnn not found after build"
+            find . -name 'onnx2ncnn*' -ls
+            exit 1
+          fi
+          echo "Found onnx2ncnn at: $ONNX2NCNN"
+          sudo cp "$ONNX2NCNN" /usr/local/bin/onnx2ncnn
+          sudo chmod +x /usr/local/bin/onnx2ncnn
+
+          # Find and install ncnnoptimize
+          NCNNOPT=$(find . -name 'ncnnoptimize' -type f | head -1)
+          if [ -z "$NCNNOPT" ]; then
+            echo "ERROR: ncnnoptimize not found after build"
+            exit 1
+          fi
+          echo "Found ncnnoptimize at: $NCNNOPT"
+          sudo cp "$NCNNOPT" /usr/local/bin/ncnnoptimize
+          sudo chmod +x /usr/local/bin/ncnnoptimize
+
+          # Verify
           echo "=== Verify ==="
-          onnx2ncnn 2>&1 | head -3 || echo "onnx2ncnn not found"
-          ncnnoptimize 2>&1 | head -3 || echo "ncnnoptimize not found"
+          which onnx2ncnn
+          which ncnnoptimize
+          onnx2ncnn 2>&1 | head -3
+          ncnnoptimize 2>&1 | head -3
 
       - name: Clone BiSeNet repo
         run: git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
