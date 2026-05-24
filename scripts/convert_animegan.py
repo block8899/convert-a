@@ -3,10 +3,11 @@
 import os
 import sys
 import subprocess
+import shutil
 
 
 def main():
-    print("=== AnimeGANv3 ONNX → NCNN ===\n")
+    print("=== AnimeGANv3 ONNX → NCNN (via PNNX) ===\n")
 
     onnx_file = "AnimeGANv3_PortraitSketch_25.onnx"
     if not os.path.exists(onnx_file):
@@ -15,7 +16,7 @@ def main():
 
     print(f"Input: {os.path.getsize(onnx_file) / 1024 / 1024:.1f} MB")
 
-    # 1. Simplify
+    # 1. Simplify ONNX (optional, improves conversion quality)
     print("\n1. Simplifying ONNX...")
     sim_file = "animegan_sim.onnx"
     ret = subprocess.run(
@@ -23,52 +24,50 @@ def main():
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
-        print(f"   Failed: {ret.stderr[:200]}")
-        sim_file = onnx_file
+        print(f"   Simplify failed, using original: {ret.stderr[:200]}")
+        shutil.copy(onnx_file, sim_file)
     else:
         print(f"   OK: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
 
-    # 2. onnx2ncnn
-    print("\n2. onnx2ncnn...")
-    os.makedirs("output", exist_ok=True)
-    raw_param = "animegan_raw.param"
-    raw_bin = "animegan_raw.bin"
+    # 2. Convert ONNX → NCNN via PNNX
+    print("\n2. Converting via PNNX...")
+    pnnx_param = "animegan_sim.ncnn.param"
+    pnnx_bin = "animegan_sim.ncnn.bin"
+
+    # Clean previous PNNX output if any
+    for f in [pnnx_param, pnnx_bin]:
+        if os.path.exists(f):
+            os.remove(f)
 
     ret = subprocess.run(
-        ["onnx2ncnn", sim_file, raw_param, raw_bin],
-        capture_output=True, text=True,
+        ["pnnx", sim_file],
+        capture_output=True, text=True, timeout=300,
     )
-    if ret.stderr:
-        print(f"   warnings: {ret.stderr[:200]}")
-
-    if not os.path.exists(raw_param):
-        print("   FAILED")
+    print(f"   stdout (last 500): {ret.stdout[-500:]}")
+    if ret.returncode != 0:
+        print(f"   stderr (last 500): {ret.stderr[-500:]}")
         sys.exit(1)
 
-    # 3. ncnnoptimize
-    print("\n3. Optimizing...")
-    ret = subprocess.run(
-        ["ncnnoptimize",
-         raw_param, raw_bin,
-         "output/animegan.param", "output/animegan.bin",
-         "65536"],
-        capture_output=True, text=True,
-    )
-    if ret.returncode != 0:
-        print(f"   ncnnoptimize failed: {ret.stderr}")
-        import shutil
-        shutil.copy(raw_param, "output/animegan.param")
-        shutil.copy(raw_bin, "output/animegan.bin")
+    if not os.path.exists(pnnx_param) or not os.path.exists(pnnx_bin):
+        print("   PNNX output files not found!")
+        sys.exit(1)
+
+    print(f"   OK: param={os.path.getsize(pnnx_param) / 1024:.1f} KB, "
+          f"bin={os.path.getsize(pnnx_bin) / 1024 / 1024:.1f} MB")
+
+    # 3. Copy to output
+    os.makedirs("output", exist_ok=True)
+    shutil.copy(pnnx_param, "output/animegan.param")
+    shutil.copy(pnnx_bin, "output/animegan.bin")
 
     # 4. Verify
     print("\n=== Output ===")
     for f in ["output/animegan.param", "output/animegan.bin"]:
         if os.path.exists(f):
             size = os.path.getsize(f)
-            if size > 1024 * 1024:
-                print(f"  {f}: {size / 1024 / 1024:.1f} MB")
-            else:
-                print(f"  {f}: {size / 1024:.1f} KB")
+            print(f"  {f}: {size / 1024 / 1024:.1f} MB"
+                  if size > 1024 * 1024
+                  else f"  {f}: {size / 1024:.1f} KB")
         else:
             print(f"  MISSING: {f}")
             sys.exit(1)
