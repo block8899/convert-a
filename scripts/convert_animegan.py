@@ -1,23 +1,26 @@
 # scripts/convert_animegan.py
 
+import torch
+import pnnx
+import onnx
 import os
 import sys
 import shutil
 import subprocess
+import gc
 
 
 def main():
-    print("=== AnimeGANv3 ONNX → NCNN ===\n")
+    print("=== AnimeGANv3 ONNX → NCNN (PNNX) ===\n")
 
     onnx_file = "AnimeGANv3_PortraitSketch_25.onnx"
-
     if not os.path.exists(onnx_file):
         print(f"MISSING: {onnx_file}")
         sys.exit(1)
 
     print(f"Input: {onnx_file} ({os.path.getsize(onnx_file) / 1024 / 1024:.1f} MB)")
 
-    # 1. Simplify
+    # 1. Simplify ONNX
     print("\n1. Simplifying ONNX...")
     sim_file = "animegan_sim.onnx"
     ret = subprocess.run(
@@ -25,46 +28,52 @@ def main():
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
-        print(f"   onnxsim failed: {ret.stderr}")
-        print("   Using original ONNX")
+        print(f"   onnxsim failed, using original: {ret.stderr}")
         sim_file = onnx_file
     else:
         print(f"   Simplified: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
 
-    # 2. onnx2ncnn
-    print("\n2. Converting to NCNN...")
-    os.makedirs("output", exist_ok=True)
+    # 2. Load ONNX → PyTorch via onnx → PNNX export
+    print("\n2. Converting via PNNX...")
+    onnx_model = onnx.load(sim_file)
 
-    param_file = "output/animegan.param"
-    bin_file = "output/animegan.bin"
+    # Get input shape from ONNX
+    input_shape = [d.dim_value for d in onnx_model.graph.input[0].type.tensor_type.shape.dim]
+    print(f"   ONNX input shape: {input_shape}")
 
-    onnx2ncnn = shutil.which("onnx2ncnn") or "onnx2ncnn"
+    # Use pnnx to convert ONNX directly
+    # PNNX can load ONNX: pnnx.export(None, "animegan", inputfiles=[sim_file])
+    # Alternative: load via torch and export
+    dummy = torch.randn(input_shape)
 
-    ret = subprocess.run(
-        [onnx2ncnn, sim_file, param_file, bin_file],
-        capture_output=True, text=True,
-    )
-
-    if ret.returncode != 0:
-        print(f"   onnx2ncnn error: {ret.stderr}")
-        if ret.stdout:
-            print(f"   stdout: {ret.stdout}")
+    try:
+        # PNNX supports ONNX input
+        pnnx.export(None, "animegan", inputs=dummy, inputfiles=[sim_file])
+        print("   PNNX from ONNX done!")
+    except Exception as e:
+        print(f"   PNNX from ONNX failed: {e}")
+        # Fallback: manual ncnn param from onnx
+        print("   Trying direct approach...")
         sys.exit(1)
 
-    # 3. Verify
-    print("\nOutput:")
-    for f in [param_file, bin_file]:
-        if os.path.exists(f):
-            size = os.path.getsize(f)
-            if size > 1024 * 1024:
-                print(f"  {f}: {size / 1024 / 1024:.1f} MB")
-            else:
-                print(f"  {f}: {size / 1024:.1f} KB")
+    del dummy
+    gc.collect()
+
+    # 3. Move outputs
+    print("\n3. Collecting outputs...")
+    os.makedirs("output", exist_ok=True)
+
+    for suffix in [".ncnn.param", ".ncnn.bin"]:
+        src = f"animegan{suffix}"
+        dst = f"output/animegan{suffix}"
+        if os.path.exists(src):
+            shutil.move(src, dst)
+            print(f"  {dst}: {os.path.getsize(dst) / 1024:.1f} KB")
         else:
-            print(f"  MISSING: {f}")
+            print(f"  MISSING: {src}")
             sys.exit(1)
 
-    print("\nAnimeGANv3 conversion OK!")
+    print("\nAnimeGANv3 OK!")
 
 
 if __name__ == "__main__":
