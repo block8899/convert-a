@@ -1,3 +1,5 @@
+# scripts/convert_animegan.py
+
 import os
 import sys
 import subprocess
@@ -5,7 +7,7 @@ import shutil
 
 
 def main():
-    print("=== AnimeGANv3 ONNX -> NCNN (fp32 + fp16) ===\n")
+    print("=== AnimeGANv3 ONNX → NCNN (via PNNX) ===\n")
 
     onnx_file = "AnimeGANv3_PortraitSketch_25.onnx"
     if not os.path.exists(onnx_file):
@@ -13,9 +15,8 @@ def main():
         sys.exit(1)
 
     print(f"Input: {os.path.getsize(onnx_file) / 1024 / 1024:.1f} MB")
-    os.makedirs("output", exist_ok=True)
 
-    # 1. Simplify
+    # 1. Simplify ONNX (optional, improves conversion quality)
     print("\n1. Simplifying ONNX...")
     sim_file = "animegan_sim.onnx"
     ret = subprocess.run(
@@ -23,55 +24,53 @@ def main():
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
-        print(f"   Failed, using original: {ret.stderr[:200]}")
+        print(f"   Simplify failed, using original: {ret.stderr[:200]}")
         shutil.copy(onnx_file, sim_file)
     else:
         print(f"   OK: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
 
-    # 2. fp32 via PNNX
-    print("\n2. Converting fp32 via PNNX...")
-    for f in ["animegan_sim.ncnn.param", "animegan_sim.ncnn.bin"]:
+    # 2. Convert ONNX → NCNN via PNNX
+    print("\n2. Converting via PNNX...")
+    pnnx_param = "animegan_sim.ncnn.param"
+    pnnx_bin = "animegan_sim.ncnn.bin"
+
+    # Clean previous PNNX output if any
+    for f in [pnnx_param, pnnx_bin]:
         if os.path.exists(f):
             os.remove(f)
 
-    ret = subprocess.run(["pnnx", sim_file], capture_output=True, text=True, timeout=300)
-    if ret.stdout.strip():
-        print(f"   stdout (last 200): {ret.stdout[-200:]}")
-
-    p_param, p_bin = "animegan_sim.ncnn.param", "animegan_sim.ncnn.bin"
-    if not os.path.exists(p_param) or not os.path.exists(p_bin):
-        print("   PNNX failed!")
-        sys.exit(1)
-
-    shutil.copy(p_param, "output/animegan.param")
-    shutil.copy(p_bin, "output/animegan.bin")
-    fp32_sz = os.path.getsize(p_bin)
-    print(f"   OK: {fp32_sz / 1024 / 1024:.1f} MB")
-
-    # 3. fp16 via custom converter
-    print("\n3. Converting bin fp32 -> fp16...")
     ret = subprocess.run(
-        [sys.executable, "scripts/ncnn_fp16_convert.py",
-         "output/animegan.bin", "output/animegan_fp16.bin"],
-        capture_output=True, text=True, timeout=120,
+        ["pnnx", sim_file],
+        capture_output=True, text=True, timeout=300,
     )
-    print(f"   {ret.stdout.strip()}")
+    print(f"   stdout (last 500): {ret.stdout[-500:]}")
     if ret.returncode != 0:
-        print(f"   FAILED:\n{ret.stderr[-500:]}")
+        print(f"   stderr (last 500): {ret.stderr[-500:]}")
         sys.exit(1)
 
-    shutil.copy("output/animegan.param", "output/animegan_fp16.param")
+    if not os.path.exists(pnnx_param) or not os.path.exists(pnnx_bin):
+        print("   PNNX output files not found!")
+        sys.exit(1)
+
+    print(f"   OK: param={os.path.getsize(pnnx_param) / 1024:.1f} KB, "
+          f"bin={os.path.getsize(pnnx_bin) / 1024 / 1024:.1f} MB")
+
+    # 3. Copy to output
+    os.makedirs("output", exist_ok=True)
+    shutil.copy(pnnx_param, "output/animegan.param")
+    shutil.copy(pnnx_bin, "output/animegan.bin")
 
     # 4. Verify
     print("\n=== Output ===")
-    for f in ["output/animegan.param", "output/animegan.bin",
-              "output/animegan_fp16.param", "output/animegan_fp16.bin"]:
+    for f in ["output/animegan.param", "output/animegan.bin"]:
         if os.path.exists(f):
-            sz = os.path.getsize(f)
-            unit = f"{sz / 1024 / 1024:.1f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
-            print(f"  {f}: {unit}")
+            size = os.path.getsize(f)
+            print(f"  {f}: {size / 1024 / 1024:.1f} MB"
+                  if size > 1024 * 1024
+                  else f"  {f}: {size / 1024:.1f} KB")
         else:
-            print(f"  {f}: MISSING")
+            print(f"  MISSING: {f}")
+            sys.exit(1)
 
     print("\nAnimeGANv3 OK!")
 
