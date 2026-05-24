@@ -18,9 +18,16 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install pnnx ncnn opencv-python-headless gdown onnxsim onnx
-          pip install onnxscript>=0.1.0
+          pip install onnxsim onnx gdown onnxscript
+          # Download ncnn tools (pre-built binaries)
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu.zip
+          unzip -q ncnn-20240820-ubuntu.zip
+          echo "$PWD/ncnn-20240820-ubuntu/bin" >> $GITHUB_PATH
 
+      - name: Verify ncnn tools
+        run: |
+          onnx2ncnn 2>&1 || true
+          echo "onnx2ncnn path: $(which onnx2ncnn)"
       - name: Clone BiSeNet repo
         run: |
           git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
