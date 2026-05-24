@@ -9,6 +9,12 @@ import shutil
 import torchvision.models as models
 import gc
 
+# ═══════════════════════════════════════════════════
+# BiSeNet Face Parsing Architecture
+# Input:  [1, 3, 512, 512]
+# Output: [1, 19, 512, 512]
+# ═══════════════════════════════════════════════════
+
 
 class Resnet18(nn.Module):
     def __init__(self):
@@ -86,15 +92,21 @@ class ContextPath(nn.Module):
 
     def forward(self, x):
         feat8, feat16, feat32, feat_cp = self.resnet(x)
+
         avg = torch.mean(feat_cp, dim=2, keepdim=True)
         avg = torch.mean(avg, dim=3, keepdim=True)
         avg = self.conv_avg(avg)
-        avg = nn.functional.interpolate(avg, size=feat_cp.size()[2:], mode='nearest')
+        avg = nn.functional.interpolate(
+            avg, size=feat_cp.size()[2:], mode='nearest')
+
         feat32_arm = self.arm32(feat_cp) + avg
         feat32_arm = self.conv_head32(feat32_arm)
-        feat32_arm = nn.functional.interpolate(feat32_arm, size=feat16.size()[2:], mode='nearest')
+        feat32_arm = nn.functional.interpolate(
+            feat32_arm, size=feat16.size()[2:], mode='nearest')
+
         feat16_arm = self.arm16(feat16) + feat32_arm
         feat16_arm = self.conv_head16(feat16_arm)
+
         return feat8, feat16, feat16_arm, feat32_arm
 
 
@@ -116,7 +128,9 @@ class SpatialPath(nn.Module):
 class FeatureFusionModule(nn.Module):
     def __init__(self, in_chan, out_chan):
         super().__init__()
-        self.convblk = ConvBNReLU(in_chan, out_chan, ks=3, stride=1, padding=1)
+        # ★ ks=1, padding=0 — matches checkpoint [256, 256, 1, 1]
+        self.convblk = ConvBNReLU(in_chan, out_chan, ks=1, stride=1, padding=0)
+        # ★ out_chan//4 = 64
         self.conv1 = nn.Conv2d(out_chan, out_chan // 4, kernel_size=1, bias=False)
         self.conv2 = nn.Conv2d(out_chan // 4, out_chan, kernel_size=1, bias=False)
         self.relu = nn.ReLU(inplace=True)
@@ -137,25 +151,31 @@ class BiSeNet(nn.Module):
         super().__init__()
         self.cp = ContextPath()
         self.sp = SpatialPath()
-        # ★ Fix: FFM output=128, BiSeNetOutput input=128
-        self.ffm = FeatureFusionModule(256, 128)
-        self.conv_out = BiSeNetOutput(128, 64, n_classes)
+        # ★ FFM: 128+128=256 input → 256 output
+        self.ffm = FeatureFusionModule(256, 256)
+        # ★ conv_out: 256→256→19
+        self.conv_out = BiSeNetOutput(256, 256, n_classes)
 
     def forward(self, x):
-        feat_sp = self.sp(x)                           # 128 ch
+        feat_sp = self.sp(x)
         feat8, feat16, feat_cp8, feat_cp16 = self.cp(x)
-        feat_fuse = self.ffm(feat_sp, feat_cp8)         # 128+128 → 128
-        feat_out = self.conv_out(feat_fuse)              # 128 → 64 → 19
+        feat_fuse = self.ffm(feat_sp, feat_cp8)
+        feat_out = self.conv_out(feat_fuse)
         out = nn.functional.interpolate(
             feat_out, size=x.size()[2:],
             mode='bilinear', align_corners=True)
         return out
 
 
+# ═══════════════════════════════════════════════════
+# CONVERT
+# ═══════════════════════════════════════════════════
+
 def main():
     print("=== BiSeNet → NCNN ===\n")
 
     model = BiSeNet(n_classes=19)
+    model.eval()
 
     weight_path = "repo_bisenet/79999_iter.pth"
     if not os.path.exists(weight_path):
@@ -165,41 +185,27 @@ def main():
     print(f"Loading: {weight_path}")
     state_dict = torch.load(weight_path, map_location='cpu')
 
-    # Clean prefixes
     clean = {}
     for k, v in state_dict.items():
         name = k.replace('module.', '') if k.startswith('module.') else k
         clean[name] = v
 
-    # ★ Debug: print all shapes from checkpoint
-    print("\n--- Checkpoint shapes ---")
-    for k, v in sorted(clean.items()):
-        print(f"  {k}: {list(v.shape)}")
-
-    # ★ Debug: print all shapes from model
-    print("\n--- Model shapes ---")
-    for k, v in sorted(model.state_dict().items()):
-        print(f"  {k}: {list(v.shape)}")
-
-    # Try load
     try:
         model.load_state_dict(clean, strict=False)
-        print("\nWeights loaded (strict=False)")
+        print("Weights loaded!")
     except Exception as e:
         print(f"\nLoad error: {e}")
-        # ★ Auto-detect mismatch and suggest fix
-        print("\n--- MISMATCHES ---")
         model_sd = model.state_dict()
+        print("\n--- MISMATCHES ---")
         for k in clean:
             if k in model_sd and clean[k].shape != model_sd[k].shape:
-                print(f"  {k}: checkpoint={list(clean[k].shape)} model={list(model_sd[k].shape)}")
+                print(f"  {k}: checkpoint={list(clean[k].shape)} "
+                      f"model={list(model_sd[k].shape)}")
         sys.exit(1)
 
-    model.eval()
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {params:,} ({params * 4 / 1024 / 1024:.1f} MB)")
 
-    # Export via PNNX
     print("\nConverting via PNNX...")
     torch.set_grad_enabled(False)
     dummy = torch.randn(1, 3, 512, 512)
