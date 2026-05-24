@@ -56,7 +56,7 @@ def main():
     shutil.copy(pnnx_bin, "output/animegan.bin")
     print("\n3. fp32 copied to output/")
 
-    # 4. Convert to fp16 via Python script
+    # 4. Convert to fp16
     print("\n4. Generating fp16 version...")
     ret = subprocess.run(
         [sys.executable, "scripts/ncnn_fp16_convert.py",
@@ -65,9 +65,8 @@ def main():
     )
     print(f"   {ret.stdout.strip()}")
     if ret.returncode != 0:
-        print(f"   fp16 failed: {ret.stderr[:300]}")
+        print(f"   fp16 failed: {ret.stderr[:500]}")
     else:
-        # param file is the same for fp16
         shutil.copy("output/animegan.param", "output/animegan_fp16.param")
 
     # 5. Verify
@@ -76,7 +75,7 @@ def main():
               "output/animegan_fp16.param", "output/animegan_fp16.bin"]:
         if os.path.exists(f):
             sz = os.path.getsize(f)
-            unit = f"{sz / 1024 / 1024:.1f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
+            unit = f"{sz / 1024 / 1024:.1f} MB" if sz > 1024 * 1024 else f"{sz / 1024:.1f} KB"
             print(f"  {f}: {unit}")
         else:
             print(f"  {f}: MISSING")
