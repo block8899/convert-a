@@ -1,0 +1,64 @@
+# .github/workflows/convert_models.yml
+name: Convert Models to NCNN
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install pnnx ncnn opencv-python-headless
+
+      - name: Clone model repos
+        run: |
+          git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
+          git clone https://github.com/TachibanaYoshinori/AnimeGANv3.git repo_animegan
+
+      - name: Download BiSeNet weights
+        run: |
+          # BiSeNet pretrained weight
+          wget -q "https://drive.google.com/uc?id=154JgKbzCPWg2WDYjvGP3DdgVpfFljHXc" \
+            -O repo_bisenet/79999_iter.pth || echo "Manual download needed"
+
+      - name: Download AnimeGANv3 weights
+        run: |
+          mkdir -p repo_animegan/checkpoints
+          cd repo_animegan/checkpoints
+          # Portrait Hayao style
+          wget -q "https://github.com/TachibanaYoshinori/AnimeGANv3/releases/download/v1.0/AnimeGANv3_Hayao.pth" \
+            -O hayao.pth || echo "Manual download needed"
+          # Portrait Shinkai style (optional)
+          wget -q "https://github.com/TachibanaYoshinori/AnimeGANv3/releases/download/v1.0/AnimeGANv3_Shinkai.pth" \
+            -O shinkai.pth || echo "Manual download needed"
+
+      - name: Convert BiSeNet → NCNN
+        run: python scripts/convert_bisenet.py
+
+      - name: Convert AnimeGANv3 → NCNN
+        run: python scripts/convert_animeganv3.py
+
+      - name: Verify outputs
+        run: |
+          echo "=== Output files ==="
+          ls -lh output/
+          echo ""
+          echo "=== File sizes ==="
+          du -sh output/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncnn-models
+          path: output/
+          retention-days: 30
