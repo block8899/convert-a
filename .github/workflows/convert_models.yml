@@ -19,6 +19,7 @@ jobs:
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install pnnx ncnn opencv-python-headless gdown onnxsim onnx
+          pip install onnxscript>=0.1.0
 
       - name: Clone BiSeNet repo
         run: |
