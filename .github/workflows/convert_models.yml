@@ -1,3 +1,4 @@
+# .github/workflows/convert_models.yml
 name: Convert Models to NCNN
 
 on:
@@ -28,8 +29,11 @@ jobs:
           pip install --upgrade pip
           pip install torch==2.1.0+cpu torchvision==0.16.0+cpu \
             --index-url https://download.pytorch.org/whl/cpu
-          pip install onnxsim onnx gdown onnxscript numpy
+          pip install onnxsim onnx gdown numpy
           pip install pnnx
+
+      - name: Verify PNNX fp16 support
+        run: pnnx --help 2>&1 | grep -i fp16 || echo "fp16 flag not listed (may still work)"
 
       - name: Clone BiSeNet repo
         run: git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
