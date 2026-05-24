@@ -8,6 +8,7 @@ import gc
 
 
 class BiSeNetWrapper(nn.Module):
+    """Wrapper to return only main output (drop aux outputs)"""
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -108,7 +109,7 @@ def main():
     shutil.copy(pnnx_bin, "output/biSeNet.bin")
     print("fp32 copied to output/")
 
-    # 5. Convert to fp16 via Python script
+    # 5. Convert to fp16
     print("\nGenerating fp16 version...")
     ret = subprocess.run(
         [sys.executable, "scripts/ncnn_fp16_convert.py",
@@ -117,7 +118,7 @@ def main():
     )
     print(f"  {ret.stdout.strip()}")
     if ret.returncode != 0:
-        print(f"  fp16 failed: {ret.stderr[:300]}")
+        print(f"  fp16 failed: {ret.stderr[:500]}")
     else:
         shutil.copy("output/biSeNet.param", "output/biSeNet_fp16.param")
 
@@ -127,7 +128,7 @@ def main():
               "output/biSeNet_fp16.param", "output/biSeNet_fp16.bin"]:
         if os.path.exists(f):
             sz = os.path.getsize(f)
-            unit = f"{sz / 1024 / 1024:.1f} MB" if sz > 1024*1024 else f"{sz / 1024:.1f} KB"
+            unit = f"{sz / 1024 / 1024:.1f} MB" if sz > 1024 * 1024 else f"{sz / 1024:.1f} KB"
             print(f"  {f}: {unit}")
         else:
             print(f"  {f}: MISSING")
