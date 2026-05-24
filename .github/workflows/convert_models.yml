@@ -1,4 +1,4 @@
-# .github/workflows/convert_models.yml
+# convert_models.yml
 name: Convert Models to NCNN
 
 on:
@@ -29,7 +29,18 @@ jobs:
           pip install --upgrade pip
           pip install --no-cache-dir torch==2.1.0+cpu torchvision==0.16.0+cpu \
             --index-url https://download.pytorch.org/whl/cpu
-          pip install --no-cache-dir pnnx onnxsim onnx gdown onnxscript
+          pip install --no-cache-dir onnxsim onnx gdown onnxscript \
+            "protobuf>=3.20.3,<5"
+
+      - name: Build ncnn tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake libprotobuf-dev protobuf-compiler
+          git clone --depth 1 https://github.com/Tencent/ncnn.git ncnn_src
+          cd ncnn_src && mkdir build && cd build
+          cmake -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_VULKAN=OFF ..
+          make -j$(nproc) onnx2ncnn
+          sudo cp tools/onnx2ncnn /usr/local/bin/
+          echo "onnx2ncnn built: $(which onnx2ncnn)"
 
       - name: Clone BiSeNet repo
         run: |
@@ -50,10 +61,8 @@ jobs:
         timeout-minutes: 30
         run: python scripts/convert_animegan.py
 
-      - name: Verify outputs
-        run: |
-          echo "=== Output ==="
-          ls -lh output/
+      - name: Verify
+        run: ls -lh output/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
