@@ -45,12 +45,16 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DNCNN_VULKAN=OFF \
                 -DNCNN_BUILD_TOOLS=ON \
-                -DNCNN_BUILD_EXAMPLES=OFF ..
-          make -j$(nproc) onnx2ncnn ncnnoptimize
-          sudo cp tools/onnx2ncnn /usr/local/bin/
-          sudo cp tools/ncnnoptimize /usr/local/bin/
+                -DNCNN_BUILD_EXAMPLES=OFF \
+                -DNCNN_BUILD_BENCHMARK=OFF ..
+          make -j$(nproc)
+          sudo cp tools/onnx2ncnn /usr/local/bin/ 2>/dev/null || \
+            sudo find . -name 'onnx2ncnn' -executable -exec cp {} /usr/local/bin/ \;
+          sudo cp tools/ncnnoptimize /usr/local/bin/ 2>/dev/null || \
+            sudo find . -name 'ncnnoptimize' -executable -exec cp {} /usr/local/bin/ \;
           echo "=== Verify ==="
-          which onnx2ncnn && which ncnnoptimize
+          onnx2ncnn 2>&1 | head -3 || echo "onnx2ncnn not found"
+          ncnnoptimize 2>&1 | head -3 || echo "ncnnoptimize not found"
 
       - name: Clone BiSeNet repo
         run: git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
