@@ -25,7 +25,7 @@ def main():
     sys.path.insert(0, 'repo_bisenet')
     from model import BiSeNet
 
-    # 1. Load model
+    # 1. Load + trace fp32
     model = BiSeNet(n_classes=19)
     state_dict = torch.load("repo_bisenet/79999_iter.pth", map_location='cpu')
     clean = {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -33,131 +33,87 @@ def main():
     model.eval()
     print("Weights loaded!")
 
-    torch.set_grad_enabled(False)
     wrapper = BiSeNetWrapper(model)
     wrapper.eval()
+    torch.set_grad_enabled(False)
     dummy = torch.randn(1, 3, 512, 512)
 
-    # 2. Export fp32 ONNX
-    print("\nExporting fp32 ONNX...")
-    onnx_fp32 = "bisenet_fp32.onnx"
-    torch.onnx.export(
-        wrapper, dummy, onnx_fp32,
-        input_names=["input"], output_names=["output"],
-        opset_version=11,
-    )
-    print(f"   {os.path.getsize(onnx_fp32) / 1024 / 1024:.1f} MB")
-
-    # 3. Trace fp32 TorchScript
-    print("\nTracing fp32 TorchScript...")
     with torch.no_grad():
         out = wrapper(dummy)
-    print(f"   {list(dummy.shape)} -> {list(out.shape)}")
+    print(f"Forward: {list(dummy.shape)} -> {list(out.shape)}")
 
     traced = torch.jit.trace(wrapper, dummy)
-    pt_fp32 = "bisenet_fp32.pt"
-    traced.save(pt_fp32)
-    print(f"   Saved: {os.path.getsize(pt_fp32) / 1024 / 1024:.1f} MB")
+    pt_file = "bisenet_traced.pt"
+    traced.save(pt_file)
+    print(f"Traced: {os.path.getsize(pt_file) / 1024 / 1024:.1f} MB")
 
     del wrapper, model, dummy, traced, out
     gc.collect()
 
     os.makedirs("output", exist_ok=True)
 
-    # 4. Simplify ONNX (for fp16 path)
-    print("\nSimplifying ONNX...")
-    sim_file = "bisenet_sim.onnx"
-    ret = subprocess.run(
-        [sys.executable, "-m", "onnxsim", onnx_fp32, sim_file],
-        capture_output=True, text=True,
-    )
-    if ret.returncode != 0:
-        print(f"   Failed, using original")
-        sim_file = onnx_fp32
-
-    # ==========================================
-    # fp32: TorchScript -> PNNX (primary)
-    #       ONNX -> PNNX (fallback)
-    # ==========================================
+    # 2. fp32 via PNNX
     print("\n--- fp32 ---")
-    fp32_param = "bisenet_fp32.ncnn.param"
-    fp32_bin = "bisenet_fp32.ncnn.bin"
-
-    for f in [fp32_param, fp32_bin]:
+    for f in ["bisenet_traced.ncnn.param", "bisenet_traced.ncnn.bin"]:
         if os.path.exists(f):
             os.remove(f)
 
-    print("  PNNX TorchScript fp32...")
     ret = subprocess.run(
-        ["pnnx", pt_fp32, "inputshape=[1,3,512,512]"],
+        ["pnnx", pt_file, "inputshape=[1,3,512,512]"],
         capture_output=True, text=True, timeout=300,
     )
     if ret.stdout.strip():
-        print(f"  stdout (last 300): {ret.stdout[-300:]}")
-    if ret.returncode != 0:
-        print(f"  stderr: {ret.stderr[-300:]}")
+        print(f"  stdout (last 200): {ret.stdout[-200:]}")
 
-    if not os.path.exists(fp32_param) or not os.path.exists(fp32_bin):
-        print("  TorchScript failed, trying ONNX fallback...")
-        ret = subprocess.run(
-            ["pnnx", sim_file],
-            capture_output=True, text=True, timeout=300,
-        )
-        if ret.stdout.strip():
-            print(f"  stdout (last 300): {ret.stdout[-300:]}")
+    p_param = "bisenet_traced.ncnn.param"
+    p_bin = "bisenet_traced.ncnn.bin"
 
-        if not os.path.exists(fp32_param) or not os.path.exists(fp32_bin):
+    if not os.path.exists(p_param) or not os.path.exists(p_bin):
+        print("  PNNX failed, trying ONNX fallback...")
+        sys.path.insert(0, 'repo_bisenet')
+        from model import BiSeNet as BS2
+        m2 = BS2(n_classes=19)
+        m2.load_state_dict(clean, strict=False)
+        m2.eval()
+        w2 = BiSeNetWrapper(m2)
+        w2.eval()
+
+        onnx_file = "bisenet.onnx"
+        torch.onnx.export(w2, torch.randn(1, 3, 512, 512), onnx_file,
+                          input_names=["input"], output_names=["output"],
+                          opset_version=11)
+
+        sim_file = "bisenet_sim.onnx"
+        subprocess.run([sys.executable, "-m", "onnxsim", onnx_file, sim_file],
+                       capture_output=True, text=True)
+
+        src = sim_file if os.path.exists(sim_file) else onnx_file
+        subprocess.run(["pnnx", src], capture_output=True, text=True, timeout=300)
+
+        if not os.path.exists(p_param) or not os.path.exists(p_bin):
             print("ERROR: All fp32 paths failed!")
             sys.exit(1)
 
-    shutil.copy(fp32_param, "output/biSeNet.param")
-    shutil.copy(fp32_bin, "output/biSeNet.bin")
-    fp32_sz = os.path.getsize(fp32_bin)
+    shutil.copy(p_param, "output/biSeNet.param")
+    shutil.copy(p_bin, "output/biSeNet.bin")
+    fp32_sz = os.path.getsize(p_bin)
     print(f"  fp32 OK: {fp32_sz / 1024 / 1024:.1f} MB")
 
-    # ==========================================
-    # fp16: onnxconverter_common -> PNNX
-    # (TorchScript fp16 impossible on CPU)
-    # ==========================================
+    # 3. fp16 via custom converter
     print("\n--- fp16 ---")
-    fp16_onnx = "bisenet_fp16.onnx"
     ret = subprocess.run(
-        [sys.executable, "scripts/convert_onnx_fp16.py", sim_file, fp16_onnx],
+        [sys.executable, "scripts/ncnn_fp16_convert.py",
+         "output/biSeNet.bin", "output/biSeNet_fp16.bin"],
         capture_output=True, text=True, timeout=120,
     )
     print(f"  {ret.stdout.strip()}")
     if ret.returncode != 0:
-        print(f"  convert_onnx_fp16 FAILED: {ret.stderr[-300:]}")
+        print(f"  FAILED:\n{ret.stderr[-500:]}")
         sys.exit(1)
 
-    fp16_param = "bisenet_fp16.ncnn.param"
-    fp16_bin = "bisenet_fp16.ncnn.bin"
+    shutil.copy("output/biSeNet.param", "output/biSeNet_fp16.param")
 
-    for f in [fp16_param, fp16_bin]:
-        if os.path.exists(f):
-            os.remove(f)
-
-    print("  PNNX fp16 ONNX...")
-    ret = subprocess.run(
-        ["pnnx", fp16_onnx],
-        capture_output=True, text=True, timeout=300,
-    )
-    if ret.stdout.strip():
-        print(f"  stdout (last 300): {ret.stdout[-300:]}")
-    if ret.returncode != 0:
-        print(f"  stderr: {ret.stderr[-300:]}")
-
-    if not os.path.exists(fp16_param) or not os.path.exists(fp16_bin):
-        print("ERROR: fp16 conversion failed!")
-        sys.exit(1)
-
-    shutil.copy(fp16_param, "output/biSeNet_fp16.param")
-    shutil.copy(fp16_bin, "output/biSeNet_fp16.bin")
-    fp16_sz = os.path.getsize(fp16_bin)
-    pct = (1 - fp16_sz / fp32_sz) * 100 if fp32_sz > 0 else 0
-    print(f"  fp16 OK: {fp16_sz / 1024 / 1024:.1f} MB (-{pct:.0f}%)")
-
-    # Verify
+    # 4. Verify
     print("\n=== Output ===")
     for f in ["output/biSeNet.param", "output/biSeNet.bin",
               "output/biSeNet_fp16.param", "output/biSeNet_fp16.bin"]:
