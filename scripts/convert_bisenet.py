@@ -38,64 +38,51 @@ def main():
     wrapper.eval()
     dummy = torch.randn(1, 3, 512, 512)
 
-    # 2. Export ONNX fp32
-    print("\nExporting ONNX fp32...")
-    onnx_file = "bisenet.onnx"
+    # 2. Export fp32 ONNX
+    print("\nExporting fp32 ONNX...")
+    onnx_fp32 = "bisenet_fp32.onnx"
     torch.onnx.export(
-        wrapper, dummy, onnx_file,
+        wrapper, dummy, onnx_fp32,
         input_names=["input"], output_names=["output"],
         opset_version=11,
     )
-    print(f"   {os.path.getsize(onnx_file) / 1024 / 1024:.1f} MB")
+    print(f"   {os.path.getsize(onnx_fp32) / 1024 / 1024:.1f} MB")
 
-    # 3. Trace TorchScript fp32
-    print("\nTracing TorchScript fp32...")
+    # 3. Trace fp32 TorchScript
+    print("\nTracing fp32 TorchScript...")
     with torch.no_grad():
         out = wrapper(dummy)
     print(f"   {list(dummy.shape)} -> {list(out.shape)}")
 
-    traced_fp32 = torch.jit.trace(wrapper, dummy)
+    traced = torch.jit.trace(wrapper, dummy)
     pt_fp32 = "bisenet_fp32.pt"
-    traced_fp32.save(pt_fp32)
+    traced.save(pt_fp32)
     print(f"   Saved: {os.path.getsize(pt_fp32) / 1024 / 1024:.1f} MB")
 
-    # 4. Trace TorchScript fp16
-    print("\nTracing TorchScript fp16...")
-    wrapper_fp16 = wrapper.half()
-    dummy_fp16 = dummy.half()
-    with torch.no_grad():
-        out16 = wrapper_fp16(dummy_fp16)
-    print(f"   {list(dummy_fp16.shape)} -> {list(out16.shape)}")
-
-    traced_fp16 = torch.jit.trace(wrapper_fp16, dummy_fp16)
-    pt_fp16 = "bisenet_fp16.pt"
-    traced_fp16.save(pt_fp16)
-    print(f"   Saved: {os.path.getsize(pt_fp16) / 1024 / 1024:.1f} MB")
-
-    # Free memory
-    del wrapper, wrapper_fp16, model, dummy, dummy_fp16
-    del traced_fp32, traced_fp16, out, out16
+    del wrapper, model, dummy, traced, out
     gc.collect()
 
-    # 5. Simplify ONNX (for fp16 fallback)
+    os.makedirs("output", exist_ok=True)
+
+    # 4. Simplify ONNX (for fp16 path)
     print("\nSimplifying ONNX...")
     sim_file = "bisenet_sim.onnx"
     ret = subprocess.run(
-        [sys.executable, "-m", "onnxsim", onnx_file, sim_file],
+        [sys.executable, "-m", "onnxsim", onnx_fp32, sim_file],
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
         print(f"   Failed, using original")
-        sim_file = onnx_file
+        sim_file = onnx_fp32
 
-    os.makedirs("output", exist_ok=True)
-
-    # 6. fp32: PNNX (TorchScript primary, ONNX fallback)
+    # ==========================================
+    # fp32: TorchScript -> PNNX (primary)
+    #       ONNX -> PNNX (fallback)
+    # ==========================================
     print("\n--- fp32 ---")
     fp32_param = "bisenet_fp32.ncnn.param"
     fp32_bin = "bisenet_fp32.ncnn.bin"
 
-    # Clean PNNX outputs
     for f in [fp32_param, fp32_bin]:
         if os.path.exists(f):
             os.remove(f)
@@ -112,7 +99,10 @@ def main():
 
     if not os.path.exists(fp32_param) or not os.path.exists(fp32_bin):
         print("  TorchScript failed, trying ONNX fallback...")
-        ret = subprocess.run(["pnnx", sim_file], capture_output=True, text=True, timeout=300)
+        ret = subprocess.run(
+            ["pnnx", sim_file],
+            capture_output=True, text=True, timeout=300,
+        )
         if ret.stdout.strip():
             print(f"  stdout (last 300): {ret.stdout[-300:]}")
 
@@ -125,8 +115,21 @@ def main():
     fp32_sz = os.path.getsize(fp32_bin)
     print(f"  fp32 OK: {fp32_sz / 1024 / 1024:.1f} MB")
 
-    # 7. fp16: PNNX fp16 TorchScript primary, ONNX fallback
+    # ==========================================
+    # fp16: onnxconverter_common -> PNNX
+    # (TorchScript fp16 impossible on CPU)
+    # ==========================================
     print("\n--- fp16 ---")
+    fp16_onnx = "bisenet_fp16.onnx"
+    ret = subprocess.run(
+        [sys.executable, "scripts/convert_onnx_fp16.py", sim_file, fp16_onnx],
+        capture_output=True, text=True, timeout=120,
+    )
+    print(f"  {ret.stdout.strip()}")
+    if ret.returncode != 0:
+        print(f"  convert_onnx_fp16 FAILED: {ret.stderr[-300:]}")
+        sys.exit(1)
+
     fp16_param = "bisenet_fp16.ncnn.param"
     fp16_bin = "bisenet_fp16.ncnn.bin"
 
@@ -134,10 +137,9 @@ def main():
         if os.path.exists(f):
             os.remove(f)
 
-    # Primary: PNNX fp16 TorchScript
-    print("  PNNX TorchScript fp16...")
+    print("  PNNX fp16 ONNX...")
     ret = subprocess.run(
-        ["pnnx", pt_fp16, "inputshape=[1,3,512,512]"],
+        ["pnnx", fp16_onnx],
         capture_output=True, text=True, timeout=300,
     )
     if ret.stdout.strip():
@@ -145,30 +147,9 @@ def main():
     if ret.returncode != 0:
         print(f"  stderr: {ret.stderr[-300:]}")
 
-    # Fallback: onnxconverter_common fp16 -> PNNX
     if not os.path.exists(fp16_param) or not os.path.exists(fp16_bin):
-        print("  TorchScript fp16 failed, trying ONNX fp16 fallback...")
-
-        fp16_onnx = "bisenet_fp16.onnx"
-        ret = subprocess.run(
-            [sys.executable, "scripts/convert_onnx_fp16.py", sim_file, fp16_onnx],
-            capture_output=True, text=True, timeout=120,
-        )
-        print(f"  {ret.stdout.strip()}")
-        if ret.returncode != 0:
-            print(f"  convert_onnx_fp16 FAILED: {ret.stderr[-300:]}")
-            sys.exit(1)
-
-        ret = subprocess.run(
-            ["pnnx", fp16_onnx],
-            capture_output=True, text=True, timeout=300,
-        )
-        if ret.stdout.strip():
-            print(f"  PNNX stdout (last 300): {ret.stdout[-300:]}")
-
-        if not os.path.exists(fp16_param) or not os.path.exists(fp16_bin):
-            print("ERROR: All fp16 paths failed!")
-            sys.exit(1)
+        print("ERROR: fp16 conversion failed!")
+        sys.exit(1)
 
     shutil.copy(fp16_param, "output/biSeNet_fp16.param")
     shutil.copy(fp16_bin, "output/biSeNet_fp16.bin")
@@ -176,7 +157,7 @@ def main():
     pct = (1 - fp16_sz / fp32_sz) * 100 if fp32_sz > 0 else 0
     print(f"  fp16 OK: {fp16_sz / 1024 / 1024:.1f} MB (-{pct:.0f}%)")
 
-    # 8. Verify
+    # Verify
     print("\n=== Output ===")
     for f in ["output/biSeNet.param", "output/biSeNet.bin",
               "output/biSeNet_fp16.param", "output/biSeNet_fp16.bin"]:
