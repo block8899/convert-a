@@ -18,35 +18,35 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install pnnx ncnn opencv-python-headless
-          pip install gdown
+          pip install pnnx ncnn opencv-python-headless gdown onnxsim onnx
 
-      - name: Download BiSeNet weights
+      - name: Clone BiSeNet repo
         run: |
-          # Google Drive ID từ link: https://drive.google.com/file/d/154JgKbzCPWg2WDYjvGP3DdgVpfFljHXc
-          gdown "154JgKbzCPWg2WDYjvGP3DdgVpfFljHXc" -O repo_bisenet/79999_iter.pth
-          # Verify file size (should be ~170MB)
+          git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
+
+      - name: Download weights from Google Drive
+        run: |
+          # BiSeNet (.pth)
+          gdown "1D7SK1aFzQ30ZEd-Q0L7I5xBjRKMnvmZL" -O repo_bisenet/79999_iter.pth
+          # AnimeGANv3 (.onnx)
+          gdown "1e868B_Siu9XQNAF9fCeyD0Nf0PYOpQxv" -O AnimeGANv3_PortraitSketch_25.onnx
+          # Verify
           ls -lh repo_bisenet/79999_iter.pth
+          ls -lh AnimeGANv3_PortraitSketch_25.onnx
 
-      - name: Download AnimeGANv2 weights
-        run: |
-          mkdir -p repo_animegan
-          gdown "1WK5MelfMlMWRiE0yVi05SSelVUWJ1Jzy" -O repo_animegan/face_paint_512_v2.pt
-          ls -lh repo_animegan/face_paint_512_v2.pt
-
-      - name: Convert BiSeNet → NCNN
+      - name: Convert BiSeNet (pth → PNNX → NCNN)
         run: python scripts/convert_bisenet.py
 
-      - name: Convert AnimeGANv3 → NCNN
-        run: python scripts/convert_animeganv3.py
+      - name: Convert AnimeGANv3 (ONNX → NCNN)
+        run: python scripts/convert_animegan.py
 
       - name: Verify outputs
         run: |
           echo "=== Output files ==="
           ls -lh output/
           echo ""
-          echo "=== File sizes ==="
-          du -sh output/*
+          echo "=== Total size ==="
+          du -sh output/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
