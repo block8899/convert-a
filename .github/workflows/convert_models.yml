@@ -23,7 +23,8 @@ jobs:
       - name: Clone model repos
         run: |
           git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
-          git clone https://github.com/TachibanaYoshinori/AnimeGANv3.git repo_animegan
+          # AnimeGANv3 — dùng repo mirror/alternative
+          git clone https://github.com/bryandlee/animegan2-pytorch.git repo_animegan
 
       - name: Download BiSeNet weights
         run: |
