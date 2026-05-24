@@ -4,30 +4,6 @@ import subprocess
 import shutil
 
 
-def run_pnnx(input_file, extra_args=None, label=""):
-    """Run PNNX and return (param_path, bin_path) or exit on failure."""
-    base = os.path.splitext(os.path.basename(input_file))[0]
-    out_param = f"{base}.ncnn.param"
-    out_bin = f"{base}.ncnn.bin"
-
-    for f in [out_param, out_bin]:
-        if os.path.exists(f):
-            os.remove(f)
-
-    cmd = ["pnnx", input_file] + (extra_args or [])
-    print(f"   Running: {' '.join(cmd)}")
-    ret = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    print(f"   stdout (last 300): {ret.stdout[-300:]}")
-    if ret.returncode != 0:
-        print(f"   stderr (last 300): {ret.stderr[-300:]}")
-
-    if not os.path.exists(out_param) or not os.path.exists(out_bin):
-        print(f"   PNNX {label} output not found!")
-        return None, None
-
-    return out_param, out_bin
-
-
 def main():
     print("=== AnimeGANv3 ONNX -> NCNN (fp32 + fp16) ===\n")
 
@@ -51,62 +27,57 @@ def main():
     else:
         print(f"   OK: {os.path.getsize(sim_file) / 1024 / 1024:.1f} MB")
 
-    os.makedirs("output", exist_ok=True)
+    # 2. Convert ONNX -> NCNN via PNNX
+    print("\n2. Converting via PNNX...")
+    pnnx_param = "animegan_sim.ncnn.param"
+    pnnx_bin = "animegan_sim.ncnn.bin"
+    for f in [pnnx_param, pnnx_bin]:
+        if os.path.exists(f):
+            os.remove(f)
 
-    # 2. fp32: PNNX (default)
-    print("\n2. Converting fp32 via PNNX...")
-    fp32_p, fp32_b = run_pnnx(sim_file, label="fp32")
-    if not fp32_p:
+    ret = subprocess.run(
+        ["pnnx", sim_file],
+        capture_output=True, text=True, timeout=300,
+    )
+    print(f"   stdout (last 300): {ret.stdout[-300:]}")
+    if ret.returncode != 0:
+        print(f"   stderr: {ret.stderr[-300:]}")
         sys.exit(1)
 
-    shutil.copy(fp32_p, "output/animegan.param")
-    shutil.copy(fp32_b, "output/animegan.bin")
-    fp32_size = os.path.getsize(fp32_b)
-    print(f"   OK: {fp32_size / 1024 / 1024:.1f} MB")
+    if not os.path.exists(pnnx_param) or not os.path.exists(pnnx_bin):
+        print("   PNNX output not found!")
+        sys.exit(1)
 
-    # 3. fp16: PNNX fp16=1 (use different filename to avoid overwrite)
-    print("\n3. Converting fp16 via PNNX...")
-    fp16_onnx = "animegan_fp16_input.onnx"
-    shutil.copy(sim_file, fp16_onnx)
+    fp32_size = os.path.getsize(pnnx_bin)
+    print(f"   OK: bin={fp32_size / 1024 / 1024:.1f} MB")
 
-    fp16_p, fp16_b = run_pnnx(fp16_onnx, extra_args=["fp16=1"], label="fp16")
-    if not fp16_p:
-        print("   PNNX fp16=1 failed — falling back to ONNX weight conversion...")
+    # 3. Copy fp32 to output
+    os.makedirs("output", exist_ok=True)
+    shutil.copy(pnnx_param, "output/animegan.param")
+    shutil.copy(pnnx_bin, "output/animegan.bin")
+    print("\n3. fp32 copied to output/")
 
-        # Fallback: convert ONNX weights manually, then PNNX without fp16 flag
-        import onnx
-        from onnx import numpy_helper, TensorProto
-        import numpy as np
+    # 4. Convert to fp16
+    print("\n4. Generating fp16 version...")
+    ret = subprocess.run(
+        [sys.executable, "scripts/ncnn_fp16_convert.py",
+         "output/animegan.bin", "output/animegan_fp16.bin"],
+        capture_output=True, text=True, timeout=120,
+    )
+    print(f"   {ret.stdout.strip()}")
+    if ret.returncode != 0:
+        print(f"   fp16 failed:\n{ret.stderr[-500:]}")
+    else:
+        shutil.copy("output/animegan.param", "output/animegan_fp16.param")
 
-        model = onnx.load(sim_file)
-        converted = 0
-        for init in model.graph.initializer:
-            if init.data_type == TensorProto.FLOAT:
-                arr = numpy_helper.to_array(init).astype(np.float16)
-                init.CopyFrom(numpy_helper.from_array(arr, init.name))
-                converted += 1
-        onnx.save(model, fp16_onnx)
-        print(f"   Converted {converted} tensors to fp16 in ONNX")
-
-        fp16_p, fp16_b = run_pnnx(fp16_onnx, label="fp16-fallback")
-        if not fp16_p:
-            print("   ERROR: All fp16 paths failed!")
-            sys.exit(1)
-
-    shutil.copy(fp16_p, "output/animegan_fp16.param")
-    shutil.copy(fp16_b, "output/animegan_fp16.bin")
-    fp16_size = os.path.getsize(fp16_b)
-    pct = (1 - fp16_size / fp32_size) * 100 if fp32_size > 0 else 0
-    print(f"   OK: {fp16_size / 1024 / 1024:.1f} MB (-{pct:.0f}%)")
-
-    # 4. Verify
+    # 5. Verify
     print("\n=== Output ===")
     for f in ["output/animegan.param", "output/animegan.bin",
               "output/animegan_fp16.param", "output/animegan_fp16.bin"]:
         if os.path.exists(f):
             sz = os.path.getsize(f)
-            unit = f"{sz / 1024 / 1024:.1f} MB" if sz > 1024 * 1024 else f"{sz / 1024:.1f} KB"
-            print(f"  {f}: {unit}")
+            print(f"  {f}: {sz / 1024 / 1024:.1f} MB" if sz > 1024*1024
+                  else f"  {f}: {sz / 1024:.1f} KB")
         else:
             print(f"  {f}: MISSING")
 
