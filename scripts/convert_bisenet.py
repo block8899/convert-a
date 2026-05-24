@@ -9,8 +9,7 @@ import subprocess
 import gc
 
 
-# ncnnoptimize flag: 1=fp16p | 2=fp16s | 4=fp16a | 65536=strip
-FP16_FLAG = "65543"
+FP16_FLAG = "65539"
 
 
 class BiSeNetWrapper(nn.Module):
