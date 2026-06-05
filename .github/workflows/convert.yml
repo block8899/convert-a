@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       model_name:
-        description: 'Tên model (không đuôi file)'
+        description: 'Tên model (không đuôi)'
         required: true
         default: '2xPublic_realplksr_dysample_layernorm_real'
       onnx_url:
-        description: 'URL file ONNX (bỏ trống nếu không cần)'
+        description: 'URL file ONNX (bỏ trống nếu không tải)'
         required: false
         default: 'https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.onnx'
       pth_url:
-        description: 'URL file PTH (dùng cho PNNX sang NCNN)'
+        description: 'URL file PTH (bỏ trống nếu không convert NCNN)'
         required: false
         default: 'https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth'
 
@@ -26,6 +26,9 @@ jobs:
       MODEL_NAME: ${{ github.event.inputs.model_name }}
 
     steps:
+      # -------------------------------------------------
+      # 1. Chuẩn bị môi trường
+      # -------------------------------------------------
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
@@ -33,10 +36,8 @@ jobs:
 
       - name: 📦 Install dependencies
         run: |
-          # PyTorch CPU + spandrel để load PTH trace TorchScript
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           pip install spandrel
-          # Build tools cho PNNX
           sudo apt-get update && sudo apt-get install -y cmake build-essential
 
       - name: 🔧 Build PNNX
@@ -48,65 +49,61 @@ jobs:
           make -j$(nproc) pnnx
           echo "/tmp/pnnx/build" >> $GITHUB_PATH
 
-      # ── XỬ LÝ ONNX ────────────────────────────────
+      # -------------------------------------------------
+      # 2. Tải ONNX (nếu có)
+      # -------------------------------------------------
       - name: ⬇️ Download ONNX
         if: github.event.inputs.onnx_url != ''
         run: |
-          wget -q --show-progress -O "${MODEL_NAME}.onnx" "${{ github.event.inputs.onnx_url }}" \
-          && echo "✅ ONNX downloaded" || echo "⚠️ ONNX download failed/skipped"
+          wget -O "${MODEL_NAME}.onnx" "${{ github.event.inputs.onnx_url }}"
+          ls -lh "${MODEL_NAME}.onnx"
 
-      # ── XỬ LÝ NCNN QUA PNNX ───────────────────────
-      - name: ⬇️ Download PTH & Export TorchScript
+      # -------------------------------------------------
+      # 3. Tải PTH và Convert sang NCNN bằng PNNX
+      # -------------------------------------------------
+      - name: ⬇️ Download PTH
         if: github.event.inputs.pth_url != ''
         run: |
-          wget -q --show-progress -O model.pth "${{ github.event.inputs.pth_url }}"
-          
-          python -c "
+          wget -O "model.pth" "${{ github.event.inputs.pth_url }}"
+          ls -lh "model.pth"
+
+      - name: 🔄 Export TorchScript
+        if: github.event.inputs.pth_url != ''
+        shell: python
+        run: |
           import torch
           from spandrel import ModelLoader
-          
-          print('📦 Loading model with spandrel...')
-          arch = ModelLoader().load_from_file('model.pth')
+
+          arch = ModelLoader().load_from_file("model.pth")
           model = arch.model.eval()
-          
-          print(f'   Arch: {arch.architecture_name} | Scale: {arch.scale}x')
-          
+
+          print(f"Arch: {arch.architecture_name}, Scale: {arch.scale}x")
+
           dummy = torch.randn(1, 3, 64, 64)
           with torch.no_grad():
               traced = torch.jit.trace(model, dummy)
-              traced.save('ts_model.pt')
-          
-          print('✅ TorchScript exported (ts_model.pt)')
-          "
+              traced.save("ts_model.pt")
 
-      - name: 🔄 PNNX: TorchScript → NCNN
+          print("TorchScript exported!")
+
+      - name: 🔄 PNNX to NCNN
         if: github.event.inputs.pth_url != ''
         run: |
-          # PNNX convert
           pnnx ts_model.pt inputshape=[1,3,64,64]
           
-          # PNNX sinh ra file ts_model.ncnn.param và ts_model.ncnn.bin
-          # Đổi tên cho chuẩn
           if [ -f "ts_model.ncnn.param" ]; then
             mv ts_model.ncnn.param "${MODEL_NAME}.ncnn.param"
             mv ts_model.ncnn.bin "${MODEL_NAME}.ncnn.bin"
-            echo "✅ PNNX conversion successful!"
+            echo "✅ NCNN conversion successful!"
           else
-            echo "❌ PNNX failed to generate NCNN files"
-            ls -la
+            echo "❌ PNNX failed"
             exit 1
           fi
 
-      # ── KẾT QUẢ ───────────────────────────────────
-      - name: 📋 Summary
-        run: |
-          echo "========================================"
-          echo " Files generated:"
-          echo "========================================"
-          ls -lh *.onnx *.ncnn.param *.ncnn.bin 2>/dev/null || true
-          echo "========================================"
-
-      - name: 📤 Upload artifacts
+      # -------------------------------------------------
+      # 4. Đẩy kết quả lên Artifact
+      # -------------------------------------------------
+      - name: 📤 Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MODEL_NAME }}
