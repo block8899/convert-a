@@ -44,13 +44,14 @@ jobs:
           model = arch.model.eval()
           dummy = torch.randn(1, 3, 64, 64)
 
-          # ONNX
+          # ÉP DÙNG TRÌNH EXPORT CŨ BẰNG dynamo=False ĐỂ TRÁNH LỖI onnxscript
           torch.onnx.export(
               model, dummy, "model.onnx",
               opset_version=17,
               input_names=["input"],
               output_names=["output"],
               dynamic_axes={"input": {0: "batch", 2: "h", 3: "w"}, "output": {0: "batch", 2: "h", 3: "w"}},
+              dynamo=False
           )
           print(f"ONNX exported | {arch.architecture_name} | {arch.scale}x")
 
