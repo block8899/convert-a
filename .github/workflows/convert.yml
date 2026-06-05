@@ -1,0 +1,117 @@
+name: Convert Real-PLKSR
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Tên model (không đuôi file)'
+        required: true
+        default: '2xPublic_realplksr_dysample_layernorm_real'
+      onnx_url:
+        description: 'URL file ONNX (bỏ trống nếu không cần)'
+        required: false
+        default: 'https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.onnx'
+      pth_url:
+        description: 'URL file PTH (dùng cho PNNX sang NCNN)'
+        required: false
+        default: 'https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth'
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    env:
+      MODEL_NAME: ${{ github.event.inputs.model_name }}
+
+    steps:
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          # PyTorch CPU + spandrel để load PTH trace TorchScript
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install spandrel
+          # Build tools cho PNNX
+          sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: 🔧 Build PNNX
+        run: |
+          git clone --depth 1 https://github.com/nihui/pnnx.git /tmp/pnnx
+          cd /tmp/pnnx
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) pnnx
+          echo "/tmp/pnnx/build" >> $GITHUB_PATH
+
+      # ── XỬ LÝ ONNX ────────────────────────────────
+      - name: ⬇️ Download ONNX
+        if: github.event.inputs.onnx_url != ''
+        run: |
+          wget -q --show-progress -O "${MODEL_NAME}.onnx" "${{ github.event.inputs.onnx_url }}" \
+          && echo "✅ ONNX downloaded" || echo "⚠️ ONNX download failed/skipped"
+
+      # ── XỬ LÝ NCNN QUA PNNX ───────────────────────
+      - name: ⬇️ Download PTH & Export TorchScript
+        if: github.event.inputs.pth_url != ''
+        run: |
+          wget -q --show-progress -O model.pth "${{ github.event.inputs.pth_url }}"
+          
+          python -c "
+          import torch
+          from spandrel import ModelLoader
+          
+          print('📦 Loading model with spandrel...')
+          arch = ModelLoader().load_from_file('model.pth')
+          model = arch.model.eval()
+          
+          print(f'   Arch: {arch.architecture_name} | Scale: {arch.scale}x')
+          
+          dummy = torch.randn(1, 3, 64, 64)
+          with torch.no_grad():
+              traced = torch.jit.trace(model, dummy)
+              traced.save('ts_model.pt')
+          
+          print('✅ TorchScript exported (ts_model.pt)')
+          "
+
+      - name: 🔄 PNNX: TorchScript → NCNN
+        if: github.event.inputs.pth_url != ''
+        run: |
+          # PNNX convert
+          pnnx ts_model.pt inputshape=[1,3,64,64]
+          
+          # PNNX sinh ra file ts_model.ncnn.param và ts_model.ncnn.bin
+          # Đổi tên cho chuẩn
+          if [ -f "ts_model.ncnn.param" ]; then
+            mv ts_model.ncnn.param "${MODEL_NAME}.ncnn.param"
+            mv ts_model.ncnn.bin "${MODEL_NAME}.ncnn.bin"
+            echo "✅ PNNX conversion successful!"
+          else
+            echo "❌ PNNX failed to generate NCNN files"
+            ls -la
+            exit 1
+          fi
+
+      # ── KẾT QUẢ ───────────────────────────────────
+      - name: 📋 Summary
+        run: |
+          echo "========================================"
+          echo " Files generated:"
+          echo "========================================"
+          ls -lh *.onnx *.ncnn.param *.ncnn.bin 2>/dev/null || true
+          echo "========================================"
+
+      - name: 📤 Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MODEL_NAME }}
+          path: |
+            *.onnx
+            *.ncnn.param
+            *.ncnn.bin
+          retention-days: 30
