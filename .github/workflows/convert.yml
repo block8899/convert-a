@@ -19,6 +19,7 @@ jobs:
       - name: 📦 Install deps
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install packaging safetensors
           pip install spandrel onnx onnxsim
           sudo apt-get update && sudo apt-get install -y cmake build-essential
 
