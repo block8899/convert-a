@@ -158,11 +158,13 @@ jobs:
           echo "=== DepthToSpace layers ==="
           grep "DepthToSpace" raw.param || echo "(none)"
 
-      - name: Auto-Fix NCNN Param (Dynamic Split -> Static Crop)
+      - name: Auto-Fix NCNN Param + Fuse MemoryData
         run: |
           python3 << 'PYEOF'
-          import re, json, os
+          import re, json, os, struct, math, numpy as np
+          import onnx
 
+          # ── Load split config ──
           blob_split_map = {}
           if os.path.exists('split_config.json'):
               with open('split_config.json') as f:
@@ -170,111 +172,175 @@ jobs:
               for node_name, info in cfg.items():
                   for blob, (s, e) in info['outputs'].items():
                       blob_split_map[blob] = (int(s), int(e))
-              print(f"Loaded {len(blob_split_map)} blob→channel_range entries")
-          else:
-              print("WARNING: split_config.json not found, fallback only")
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          def fix_ncnn_param(input_file, output_file):
-              with open(input_file, 'r') as f:
-                  lines = f.readlines()
+          # ── Load ONNX for initializer data ──
+          onnx_model = onnx.load("merged.onnx")
+          init_map = {}
+          for init in onnx_model.graph.initializer:
+              init_map[init.name] = init
+          print(f"Loaded {len(init_map)} ONNX initializers")
 
-              magic   = lines[0]
-              counts  = lines[1].strip().split()
-              layer_count = int(counts[0])
-              blob_count  = int(counts[1])
+          # ── Read raw.bin ──
+          with open('raw.bin', 'rb') as f:
+              bin_data = bytearray(f.read())
+          print(f"raw.bin: {len(bin_data)} bytes")
 
-              new_lines = [magic, lines[1]]
-              removed = 0
-              added   = 0
+          # ── Process param ──
+          with open('2xParagonSR_Nano_gan.param', 'r') as f:
+              lines = f.readlines()
 
-              for line in lines[2:]:
-                  parts = line.strip().split()
-                  if not parts:
+          magic  = lines[0]
+          counts = lines[1].strip().split()
+          total_layers = int(counts[0])
+          total_blobs  = int(counts[1])
+
+          new_lines = [magic, lines[1]]
+          md_fixed = 0
+          md_skipped = 0
+          removed_count = 0
+          added_count = 0
+
+          for line in lines[2:]:
+              parts = line.strip().split()
+              if not parts:
+                  new_lines.append(line)
+                  continue
+
+              op_type   = parts[0]
+              node_name = parts[1]
+
+              # ── Remove val_24 + splitncnn_0 (orphan) ──
+              if op_type == 'MemoryData' and node_name == 'val_24':
+                  removed_count += 1
+                  print(f"  Removed orphan: MemoryData val_24")
+                  continue
+              if op_type == 'Split' and node_name == 'splitncnn_0':
+                  removed_count += 1
+                  print(f"  Removed orphan: Split splitncnn_0")
+                  continue
+
+              # ── Fix MemoryData: write data to .bin, add offset+size ──
+              if op_type == 'MemoryData':
+                  try:
+                      num_out = int(parts[3])
+                      out_blob = parts[4]
+
+                      # Parse w,h,d,c from existing params
+                      w = h = d = c = 1
+                      param_dict = {}
+                      for p in parts[5:]:
+                          if '=' in p:
+                              k, v = p.split('=', 1)
+                              param_dict[int(k)] = int(v)
+
+                      w = param_dict.get(0, 1)
+                      h = param_dict.get(1, 1)
+                      d = param_dict.get(2, 1)
+                      c = param_dict.get(3, 1)
+                      total_elems = w * h * d * c
+
+                      if out_blob in init_map:
+                          arr = np.array(onnx.numpy_helper.to_array(init_map[out_blob]),
+                                         dtype=np.float32).flatten()
+                          if len(arr) == total_elems:
+                              # Align to 4 bytes
+                              while len(bin_data) % 4 != 0:
+                                  bin_data.append(0)
+                              offset = len(bin_data)
+                              bin_data.extend(arr.tobytes())
+                              size_bytes = len(arr) * 4
+
+                              new_line = (f"MemoryData {node_name} 0 1 {out_blob} "
+                                         f"0={w} 1={h} 2={d} 3={c} "
+                                         f"10={offset} 11={size_bytes}\n")
+                              new_lines.append(new_line)
+                              md_fixed += 1
+                              print(f"  Fixed: {node_name} "
+                                    f"({total_elems} floats, offset={offset})")
+                              continue
+                          else:
+                              md_skipped += 1
+                              print(f"  Skip: {node_name} shape mismatch "
+                                    f"(param={total_elems}, init={len(arr)})")
+                      else:
+                          md_skipped += 1
+                          print(f"  Skip: {node_name} not in ONNX initializers")
+                  except Exception as e:
+                      md_skipped += 1
+                      print(f"  Error: {node_name}: {e}")
+
+              # ── Dynamic Split → static Crop ──
+              if op_type in ['Slice', 'Split']:
+                  try:
+                      num_inputs  = int(parts[2])
+                      num_outputs = int(parts[3])
+                  except (IndexError, ValueError):
                       new_lines.append(line)
                       continue
 
-                  op_type   = parts[0]
-                  node_name = parts[1]
+                  if num_inputs > 1:
+                      input_blobs  = parts[4 : 4 + num_inputs]
+                      output_blobs = parts[4 + num_inputs : 4 + num_inputs + num_outputs]
+                      data_blob    = input_blobs[0]
 
-                  # ── Xóa MemoryData val_24 (mồ côi) ──
-                  if op_type == 'MemoryData' and node_name == 'val_24':
-                      removed += 1
-                      print(f"  Removed orphan: MemoryData val_24")
-                      continue
-
-                  # ── Xóa Split splitncnn_0 (mồ côi, chia val_24) ──
-                  if op_type == 'Split' and node_name == 'splitncnn_0':
-                      removed += 1
-                      print(f"  Removed orphan: Split splitncnn_0")
-                      continue
-
-                  # ── Dynamic Split/Slice → static Crop ──
-                  if op_type in ['Slice', 'Split']:
-                      try:
-                          num_inputs  = int(parts[2])
-                          num_outputs = int(parts[3])
-                      except (IndexError, ValueError):
-                          new_lines.append(line)
-                          continue
-
-                      if num_inputs > 1:
-                          input_blobs  = parts[4 : 4 + num_inputs]
-                          output_blobs = parts[4 + num_inputs : 4 + num_inputs + num_outputs]
-                          data_blob    = input_blobs[0]
-
-                          for i, out_blob in enumerate(output_blobs):
-                              if out_blob in blob_split_map:
-                                  start, end = blob_split_map[out_blob]
+                      for i, out_blob in enumerate(output_blobs):
+                          if out_blob in blob_split_map:
+                              start, end = blob_split_map[out_blob]
+                          else:
+                              idx = -1
+                              match = re.search(r'_(\d+)$', out_blob)
+                              if match:
+                                  idx = int(match.group(1))
+                              if idx not in FALLBACK:
+                                  idx = i
+                              if idx in FALLBACK:
+                                  start, end = FALLBACK[idx]
                               else:
-                                  idx = -1
-                                  match = re.search(r'_(\d+)$', out_blob)
-                                  if match:
-                                      idx = int(match.group(1))
-                                  if idx not in FALLBACK:
-                                      idx = i
-                                  if idx in FALLBACK:
-                                      start, end = FALLBACK[idx]
-                                  else:
-                                      new_lines.append(line)
-                                      continue
-
-                              ncrop = end - start
-                              if ncrop <= 0:
                                   new_lines.append(line)
                                   continue
 
-                              # ★ 2=coffset  6=outc (số channel crop)
-                              static_line = (
-                                  f"Crop"
-                                  f"            {node_name}_{i}"
-                                  f" 1 1"
-                                  f" {data_blob}"
-                                  f" {out_blob}"
-                                  f" 2={start}"
-                                  f" 6={ncrop}\n"
-                              )
-                              new_lines.append(static_line)
-                              added += 1
-                              print(f"  Crop {node_name}_{i}: "
-                                    f"coffset={start} outc={ncrop}")
+                          ncrop = end - start
+                          if ncrop <= 0:
+                              new_lines.append(line)
+                              continue
 
-                          removed += 1
-                          print(f"  Replaced '{node_name}' → {num_outputs} Crop")
-                          continue
+                          static_line = (
+                              f"Crop"
+                              f"            {node_name}_{i}"
+                              f" 1 1"
+                              f" {data_blob}"
+                              f" {out_blob}"
+                              f" 2={start}"
+                              f" 6={ncrop}\n"
+                          )
+                          new_lines.append(static_line)
+                          added_count += 1
 
-                  new_lines.append(line)
+                      removed_count += 1
+                      print(f"  Replaced '{node_name}' → {num_outputs} Crop")
+                      continue
 
-              new_layer_count = layer_count - removed + added
-              new_lines[1] = f"{new_layer_count} {blob_count}\n"
+              new_lines.append(line)
 
-              with open(output_file, 'w') as f:
-                  f.writelines(new_lines)
+          # ── Update header ──
+          final_layers = total_layers - removed_count + added_count
+          new_lines[1] = f"{final_layers} {total_blobs}\n"
 
-              print(f"\n✅ Removed {removed} nodes, added {added} Crop nodes")
+          # ── Write updated param ──
+          with open('2xParagonSR_Nano_gan.param', 'w') as f:
+              f.writelines(new_lines)
 
-          fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
+          # ── Write updated bin ──
+          while len(bin_data) % 4 != 0:
+              bin_data.append(0)
+          with open('2xParagonSR_Nano_gan.bin', 'wb') as f:
+              f.write(bin_data)
+
+          print(f"\n✅ MemoryData fixed: {md_fixed}, skipped: {md_skipped}")
+          print(f"✅ Removed: {removed_count}, Added Crop: {added_count}")
+          print(f"✅ Bin: {len(bin_data)} bytes")
           PYEOF
 
       # ── Sửa DepthToSpace → PixelShuffle với tham số đúng ──
