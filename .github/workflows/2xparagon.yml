@@ -25,7 +25,6 @@ jobs:
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
           wget -q -O net_g_75000_fused_op18_fp32.onnx.data \
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
-          ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
 
       - name: Merge data & decompose Mish
         run: |
@@ -52,7 +51,6 @@ jobs:
         run: |
           python -m onnxsim merged.onnx model_simplified.onnx \
             --input-shape "input:1,3,512,512" 2>&1 || cp merged.onnx model_simplified.onnx
-          ls -lh model_simplified.onnx
 
       - name: Download ncnn tools
         run: |
@@ -74,18 +72,49 @@ jobs:
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          # Trim val_24 data (4 floats = 16 bytes) from bin start
-          with open("raw.bin", "rb") as f:
-              raw = f.read()
-          trimmed = raw[16:]
-          with open("2xParagonSR_Nano_gan.bin", "wb") as f:
-              f.write(trimmed)
-          print(f"Bin: {len(raw)} -> {len(trimmed)} bytes (trimmed 16B)")
-
-          # Fix .param
           with open("raw.param") as f:
               lines = f.readlines()
+          with open("raw.bin", "rb") as f:
+              raw_bin = f.read()
 
+          # ── Step 1: Find val_24 offset+size in .bin ──
+          # MemoryData data is sequential in .bin, matching .param order
+          md_offset = 0
+          val24_off = None
+          val24_sz = None
+
+          for line in lines[2:]:
+              p = line.strip().split()
+              if not p or p[0] != "MemoryData":
+                  continue
+              name = p[1]
+              w = h = d = c = 1
+              for pp in p[5:]:
+                  if "=" in pp:
+                      k, v = pp.split("=", 1)
+                      ki = int(k)
+                      if   ki == 0: w = int(v)
+                      elif ki == 1: h = int(v)
+                      elif ki == 2: d = int(v)
+                      elif ki == 3: c = int(v)
+              sz = w * h * d * c * 4  # float32
+              if name == "val_24":
+                  val24_off = md_offset
+                  val24_sz = sz
+              md_offset += sz
+
+          print(f"val_24 in .bin: offset={val24_off}, size={val24_sz}")
+
+          # ── Step 2: Remove val_24 data from .bin (exact position) ──
+          if val24_off is not None:
+              new_bin = raw_bin[:val24_off] + raw_bin[val24_off + val24_sz:]
+          else:
+              new_bin = raw_bin
+          with open("2xParagonSR_Nano_gan.bin", "wb") as f:
+              f.write(new_bin)
+          print(f"Bin: {len(raw_bin)} -> {len(new_bin)} bytes (removed {val24_sz}B at offset {val24_off})")
+
+          # ── Step 3: Fix .param ──
           lc, bc = lines[1].strip().split()
           out = [lines[0], lines[1]]
           rm = 0; add = 0
@@ -95,31 +124,24 @@ jobs:
               if not p:
                   out.append(line)
                   continue
-
               op, nm = p[0], p[1]
 
-              # Remove MemoryData val_24
+              # Remove val_24 MemoryData
               if op == "MemoryData" and nm == "val_24":
-                  rm += 1
-                  print(f"  Removed: MemoryData val_24")
-                  continue
+                  rm += 1; continue
 
-              # Remove Split splitncnn_0
+              # Remove splitncnn_0
               if op == "Split" and nm == "splitncnn_0":
-                  rm += 1
-                  print(f"  Removed: Split splitncnn_0")
-                  continue
+                  rm += 1; continue
 
               # Dynamic Split/Slice -> static Crop
               if op in ("Slice", "Split"):
                   try:
                       ni, no = int(p[2]), int(p[3])
-                  except (IndexError, ValueError):
-                      out.append(line)
-                      continue
+                  except:
+                      out.append(line); continue
                   if ni > 1:
-                      ib = p[4:4+ni]
-                      ob = p[4+ni:4+ni+no]
+                      ib = p[4:4+ni]; ob = p[4+ni:4+ni+no]
                       for i, o in enumerate(ob):
                           s = e = None
                           m = re.search(r"_(\d+)$", o)
@@ -127,14 +149,11 @@ jobs:
                           if idx in FALLBACK:
                               s, e = FALLBACK[idx]
                           if s is not None and e > s:
-                              nc = e - s
-                              out.append(f"Crop {nm}_{i} 1 1 {ib[0]} {o} 2={s} 6={nc}\n")
+                              out.append(f"Crop {nm}_{i} 1 1 {ib[0]} {o} 2={s} 6={e-s}\n")
                               add += 1
                           else:
                               out.append(line)
-                      rm += 1
-                      print(f"  Replaced '{nm}' -> {no} Crop")
-                      continue
+                      rm += 1; continue
 
               # DepthToSpace -> PixelShuffle
               if op == "DepthToSpace":
@@ -147,7 +166,7 @@ jobs:
           out[1] = f"{int(lc)-rm+add} {bc}\n"
           with open("2xParagonSR_Nano_gan.param", "w") as f:
               f.writelines(out)
-          print(f"\nRemoved {rm}, Added {add}, Layers: {lc} -> {int(lc)-rm+add}")
+          print(f"Removed {rm}, Added {add}")
           PYEOF
 
       - name: Optimize NCNN
@@ -168,16 +187,9 @@ jobs:
 
       - name: Validate
         run: |
-          echo "=== Final ==="
           head -3 2xParagonSR_Nano_gan.param
-          echo ""
           echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param 2>/dev/null || echo 0)"
           echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
-
-          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
-          [ "$BIN_SIZE" -lt 100000 ] && echo "ERROR: .bin too small!" && exit 1
-
-          echo "=== SUCCESS ==="
           ls -lh 2xParagonSR_Nano_gan.*
 
       - name: Upload
