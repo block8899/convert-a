@@ -22,73 +22,187 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python deps
-        run: pip install onnx onnxsim numpy
+        run: pip install onnx onnxsim onnxruntime numpy
 
-      # ── 1. Tải ONNX có sẵn ───────────────────────────────────────────────
+      # ── 1. Tải ONNX ───────────────────────────────────────────────────────
       - name: Download ONNX model
         run: |
           wget -q -O "${MODEL_NAME}.onnx" "$ONNX_URL"
           ls -lh "${MODEL_NAME}.onnx"
 
-      # ── 2. Simplify ONNX ──────────────────────────────────────────────────
+      # ── 2. Kiểm tra các op không được ncnn hỗ trợ ────────────────────────
+      - name: Audit unsupported ops
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+
+          UNSUPPORTED = {
+              "ScatterND", "GatherND", "NonMaxSuppression",
+              "TfIdfVectorizer", "StringNormalizer",
+          }
+          RISKY = {
+              "Equal", "Where", "ConstantOfShape", "Loop", "If", "Scan",
+              "Cast", "Expand", "GridSample",
+          }
+
+          model = onnx.load("${{ env.MODEL_NAME }}.onnx")
+          ops = {}
+          for node in model.graph.node:
+              ops[node.op_type] = ops.get(node.op_type, 0) + 1
+
+          print("=== Op count ===")
+          for op, count in sorted(ops.items()):
+              tag = ""
+              if op in UNSUPPORTED: tag = "  ❌ UNSUPPORTED"
+              elif op in RISKY:     tag = "  ⚠️  RISKY"
+              print(f"  {op}: {count}{tag}")
+
+          blockers = [op for op in ops if op in UNSUPPORTED]
+          if blockers:
+              print(f"\n❌ BLOCKERS found: {blockers}")
+              print("These ops are NOT supported by ncnn and will cause failures.")
+          else:
+              print("\n✅ No hard blockers found")
+          PYEOF
+
+      # ── 3. Pre-process ONNX: thay thế các op động bằng op tương đương ────
+      - name: Pre-process ONNX (replace unsupported ops)
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+          from onnx import helper, TensorProto, numpy_helper
+          import numpy as np
+
+          model = onnx.load("${{ env.MODEL_NAME }}.onnx")
+          nodes = list(model.graph.node)
+          new_nodes = []
+          replaced = {}
+
+          for node in nodes:
+              op = node.op_type
+
+              # Cast → Identity (fp32 model, type không đổi)
+              if op == "Cast":
+                  to_type = next(
+                      (a.i for a in node.attribute if a.name == "to"), None
+                  )
+                  # Nếu cast về float (1) thì giữ nguyên dữ liệu
+                  if to_type in (1, 10, 11):  # float16/float/double
+                      identity = helper.make_node(
+                          "Identity", node.input[:1], node.output
+                      )
+                      new_nodes.append(identity)
+                      replaced[op] = replaced.get(op, 0) + 1
+                      continue
+
+              new_nodes.append(node)
+
+          del model.graph.node[:]
+          model.graph.node.extend(new_nodes)
+
+          # Cleanup: remove unused initializers (optional, helps onnxsim)
+          model = onnx.shape_inference.infer_shapes(model)
+
+          onnx.save(model, "${{ env.MODEL_NAME }}_preproc.onnx",
+                    save_as_external_data=False)
+
+          print("Replaced ops:", replaced)
+          print("Pre-processed ONNX saved.")
+          PYEOF
+
+      # ── 4. Simplify ONNX ──────────────────────────────────────────────────
       - name: Simplify ONNX
         run: |
           python -m onnxsim \
-            "${MODEL_NAME}.onnx" \
+            "${MODEL_NAME}_preproc.onnx" \
             "${MODEL_NAME}_sim.onnx" \
             --input-shape "input:1,3,256,256" 2>&1 \
-            || cp "${MODEL_NAME}.onnx" "${MODEL_NAME}_sim.onnx"
+            || cp "${MODEL_NAME}_preproc.onnx" "${MODEL_NAME}_sim.onnx"
           ls -lh "${MODEL_NAME}_sim.onnx"
 
-      # ── 3. Cài ncnn tools (version cố định, ổn định) ─────────────────────
-      - name: Download ncnn tools
+      # ── 5. Kiểm tra lại sau simplify ─────────────────────────────────────
+      - name: Post-sim audit
         run: |
+          python3 << 'PYEOF'
+          import onnx
+          model = onnx.load("${{ env.MODEL_NAME }}_sim.onnx")
+          ops = {}
+          for node in model.graph.node:
+              ops[node.op_type] = ops.get(node.op_type, 0) + 1
+
+          UNSUPPORTED = {"ScatterND", "GatherND", "NonMaxSuppression"}
+          blockers = [op for op in ops if op in UNSUPPORTED]
+          print("Remaining ops:", sorted(ops.keys()))
+          if blockers:
+              print(f"❌ Still have blockers: {blockers}")
+              exit(1)
+          else:
+              print("✅ Ready for ncnn conversion")
+          PYEOF
+
+      # ── 6. Cài ncnn tools ─────────────────────────────────────────────────
+      - name: Install NCNN tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wget unzip
+
           wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/ncnn-${NCNN_VER}-ubuntu-2204.zip"
           unzip -q "ncnn-${NCNN_VER}-ubuntu-2204.zip"
           chmod +x "ncnn-${NCNN_VER}-ubuntu-2204/bin/"*
 
-          # libprotobuf23 cần thiết cho onnx2ncnn trên Ubuntu 22.04
           wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
           sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
 
-      # ── 4. Convert ONNX → NCNN ────────────────────────────────────────────
+      # ── 7. Convert ONNX → NCNN ────────────────────────────────────────────
       - name: Convert ONNX to NCNN
         run: |
           ONNX2NCNN="./ncnn-${NCNN_VER}-ubuntu-2204/bin/onnx2ncnn"
           $ONNX2NCNN "${MODEL_NAME}_sim.onnx" raw.param raw.bin 2>&1
 
           if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
-            echo "ERROR: onnx2ncnn failed!"
+            echo "❌ ERROR: onnx2ncnn failed!"
             exit 1
           fi
           echo "=== onnx2ncnn OK ==="
           ls -lh raw.param raw.bin
 
-      # ── 5. Post-process param (DepthToSpace → PixelShuffle) ───────────────
+      # ── 8. Post-process param ─────────────────────────────────────────────
       - name: Post-process NCNN param
         run: |
           cp raw.param "${MODEL_NAME}.param"
           cp raw.bin   "${MODEL_NAME}.bin"
 
+          # DepthToSpace → PixelShuffle (phòng khi onnxsim không fold)
           if grep -q "DepthToSpace" "${MODEL_NAME}.param"; then
             echo "Replacing DepthToSpace → PixelShuffle..."
             sed -i 's/DepthToSpace/PixelShuffle/g' "${MODEL_NAME}.param"
           fi
 
-          echo "=== Param validation ==="
-          head -3 "${MODEL_NAME}.param"
+          # Báo cáo các op còn lại trong param để debug
+          echo "=== Op types in final param ==="
+          awk 'NR>2 {print $1}' "${MODEL_NAME}.param" | sort | uniq -c | sort -rn | head -30
 
+          echo ""
+          echo "=== Risky ops check ==="
+          for op in ScatterND GatherND Equal Where ConstantOfShape GridSample Cast; do
+            count=$(grep -c "^$op " "${MODEL_NAME}.param" || true)
+            if [ "$count" -gt 0 ]; then
+              echo "  ⚠️  $op: $count instances (may cause inference issues)"
+            fi
+          done
+
+          # Kiểm tra size tối thiểu
           BIN_SIZE=$(stat -c%s "${MODEL_NAME}.bin")
           if [ "$BIN_SIZE" -lt 50000 ]; then
-            echo "ERROR: .bin too small (${BIN_SIZE} bytes) — conversion likely failed!"
+            echo "❌ ERROR: .bin too small (${BIN_SIZE} bytes)"
             exit 1
           fi
 
           echo ""
-          echo "=== CONVERSION SUCCESS ==="
+          echo "=== CONVERSION DONE ==="
           ls -lh "${MODEL_NAME}.param" "${MODEL_NAME}.bin"
 
-      # ── 6. Upload artifacts ───────────────────────────────────────────────
+      # ── 9. Upload artifacts ───────────────────────────────────────────────
       - name: Upload NCNN model
         uses: actions/upload-artifact@v4
         with:
@@ -97,3 +211,10 @@ jobs:
             ${{ env.MODEL_NAME }}.param
             ${{ env.MODEL_NAME }}.bin
           retention-days: 90
+
+      - name: Upload debug ONNX
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MODEL_NAME }}_onnx_sim
+          path: ${{ env.MODEL_NAME }}_sim.onnx
+          retention-days: 7
