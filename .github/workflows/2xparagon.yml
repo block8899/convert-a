@@ -131,7 +131,7 @@ jobs:
 
                   op_type = parts[0]
 
-                  # Xử lý cả Slice và Split dynamic (onnx2ncnn có thể sinh ra 1 trong 2 loại)
+                  # Xử lý cả Slice và Split dynamic
                   if op_type not in ['Slice', 'Split']:
                       new_lines.append(line)
                       continue
@@ -157,13 +157,11 @@ jobs:
                   data_blob = input_blobs[0]
 
                   for i, out_blob in enumerate(output_blobs):
-                      # Tìm số thứ tự ở đuôi blob (VD: split_0, split_1) để map đúng kích thước channel
                       idx = -1
                       match = re.search(r'_(\d+)$', out_blob)
                       if match:
                           idx = int(match.group(1))
                       
-                      # Nếu không tìm thấy đuôi số, dùng thứ tự lặp i làm fallback
                       if idx not in SPLIT_MAP:
                           idx = i
 
@@ -171,7 +169,7 @@ jobs:
                           start, end = SPLIT_MAP[idx]
                       else:
                           print(f"  WARNING: Không tìm thấy map cho index {idx} của blob {out_blob}")
-                          start, end = 0, 0 # Fallback an toàn
+                          start, end = 0, 0
 
                       static_line = (
                           f"Slice"
@@ -202,7 +200,7 @@ jobs:
           fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
           
-      - name: Post-process & final check
+      - name: Pre-process (Copy Bin & PixelShuffle)
         run: |
           cp raw.bin 2xParagonSR_Nano_gan.bin
 
@@ -212,14 +210,44 @@ jobs:
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
+      - name: Optimize NCNN (Fuse MemoryData & Constants into Bin)
+        run: |
+          NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
+          
+          echo "Running ncnnoptimize to fuse MemoryData and constant nodes..."
+          # Tham số "0" ở cuối nghĩa là giữ fp32, không chuyển sang fp16
+          $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin optimized.param optimized.bin 0
+          
+          # Ghi đè file cũ bằng file đã tối ưu
+          mv optimized.param 2xParagonSR_Nano_gan.param
+          mv optimized.bin 2xParagonSR_Nano_gan.bin
+          
+          echo "✅ ncnnoptimize completed successfully."
+
+      - name: Final check & Validate
+        run: |
           echo "=== Final Param Validation ==="
           head -3 2xParagonSR_Nano_gan.param
+          
+          # Kiểm tra tên đầu vào bắt buộc là "input"
+          if grep -q "Input.*input" 2xParagonSR_Nano_gan.param; then
+            echo "✅ Input tensor name is correctly set to 'input'"
+          else
+            echo "⚠️ WARNING: Input tensor name might not be 'input'!"
+          fi
           
           # Đảm bảo không còn Slice/Split động
           if grep -E "(Slice|Split).*\-23300=.*\-233" 2xParagonSR_Nano_gan.param; then
             echo "⚠️ WARNING: File still contains dynamic Slice/Split!"
           else
             echo "✅ Model is completely clean from dynamic Slice/Split!"
+          fi
+
+          # Đảm bảo không còn MemoryData rác (ncnnoptimize đã gộp vào bin)
+          if grep -q "MemoryData" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains MemoryData layers! ncnnoptimize might have failed to fuse them."
+          else
+            echo "✅ Model is clean from unnecessary MemoryData layers!"
           fi
 
           echo "Static Slice layers: $(grep -c 'Slice.*\-23300=1' 2xParagonSR_Nano_gan.param || echo 0)"
