@@ -33,16 +33,15 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import onnx, os, torch
-          from onnx import helper, numpy_helper
+          from onnx import helper
           from onnx2torch import convert
 
-          # ── Step 1: Merge external data ──
+          # 1. Merge external data
           print("1. Merging external data...")
           model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
-          print(f"   Original opset: {model.opset_import[0].version}")
 
-          # ── Step 2: Decompose Mish -> Softplus + Tanh + Mul ──
-          print("2. Decomposing Mish nodes...")
+          # 2. Decompose Mish
+          print("2. Decomposing Mish...")
           new_nodes = []
           mish_count = 0
           for node in model.graph.node:
@@ -50,52 +49,42 @@ jobs:
                   mish_count += 1
                   x = node.input[0]
                   y = node.output[0]
-                  sp = y + "_softplus"
-                  th = y + "_tanh"
-                  new_nodes.append(helper.make_node("Softplus", [x], [sp]))
-                  new_nodes.append(helper.make_node("Tanh", [sp], [th]))
-                  new_nodes.append(helper.make_node("Mul", [x, th], [y]))
+                  new_nodes.append(helper.make_node("Softplus", [x], [y + "_sp"]))
+                  new_nodes.append(helper.make_node("Tanh", [y + "_sp"], [y + "_th"]))
+                  new_nodes.append(helper.make_node("Mul", [x, y + "_th"], [y]))
               else:
                   new_nodes.append(node)
           del model.graph.node[:]
           model.graph.node.extend(new_nodes)
           print(f"   Replaced {mish_count} Mish nodes")
 
-          # ── Step 3: Downgrade opset 18 -> 13 ──
+          # 3. Downgrade opset
           print("3. Downgrading opset 18 -> 13...")
           model.opset_import[0].version = 13
-
-          # ── Step 4: Handle Split opset difference ──
-          # opset 13 Split: split sizes in input[1] (initializer)
-          # onnx2torch supports this. No change needed.
           onnx.save(model, "model_clean.onnx", save_as_external_data=False)
-          size_mb = os.path.getsize("model_clean.onnx") / (1024*1024)
-          print(f"   Saved model_clean.onnx ({size_mb:.1f} MB)")
+          print(f"   Saved ({os.path.getsize('model_clean.onnx')/(1024*1024):.1f} MB)")
 
-          # ── Step 5: ONNX -> PyTorch ──
-          print("4. Converting ONNX -> PyTorch...")
+          # 4. ONNX -> PyTorch
+          print("4. ONNX -> PyTorch...")
           pytorch_model = convert("model_clean.onnx")
           pytorch_model.eval()
-          print(f"   Model type: {type(pytorch_model).__name__}")
 
-          # Sanity check
-          dummy = torch.randn(1, 3, 64, 64)
+          dummy = torch.randn(1, 3, 128, 128)
           with torch.no_grad():
               out = pytorch_model(dummy)
           print(f"   Sanity: {list(dummy.shape)} -> {list(out.shape)}")
 
-          # ── Step 6: Save .pth ──
+          # 5. Save .pth
           torch.save(pytorch_model.state_dict(), "model.pth")
-          print(f"   Saved model.pth ({os.path.getsize('model.pth')/(1024*1024):.1f} MB)")
 
-          # ── Step 7: TorchScript for PNNX ──
-          print("5. Exporting TorchScript...")
+          # 6. TorchScript (trace với 128x128, cùng shape PNNX)
+          print("5. Exporting TorchScript (128x128)...")
           with torch.no_grad():
               traced = torch.jit.trace(pytorch_model, dummy)
           traced.save("model.pt")
           print(f"   Saved model.pt ({os.path.getsize('model.pt')/(1024*1024):.1f} MB)")
 
-          print("\n✅ ONNX -> PyTorch -> TorchScript OK")
+          print("\n✅ OK")
           PYEOF
 
       - name: PNNX -> NCNN
@@ -105,7 +94,7 @@ jobs:
           if [ -f "model.ncnn.param" ]; then
             mv model.ncnn.param 2xParagonSR_Nano_gan.param
             mv model.ncnn.bin   2xParagonSR_Nano_gan.bin
-            echo "✅ PNNX conversion OK"
+            echo "✅ PNNX OK"
           else
             echo "❌ PNNX failed"
             exit 1
@@ -116,23 +105,15 @@ jobs:
           echo "=== Param Header ==="
           head -3 2xParagonSR_Nano_gan.param
           echo ""
-
-          MD=$(grep -c "MemoryData" 2xParagonSR_Nano_gan.param 2>/dev/null || echo "0")
-          echo "MemoryData: $MD"
+          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param 2>/dev/null || echo 0)"
           echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
           echo ""
-
           echo "=== Layer summary ==="
           awk 'NR>2 {print $1}' 2xParagonSR_Nano_gan.param | sort | uniq -c | sort -rn
           echo ""
-
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
-          if [ "$BIN_SIZE" -lt 50000 ]; then
-            echo "ERROR: .bin too small ($BIN_SIZE bytes)!"
-            exit 1
-          fi
-
-          echo "=== CONVERSION SUCCESS ==="
+          [ "$BIN_SIZE" -lt 50000 ] && echo "ERROR: .bin too small!" && exit 1
+          echo "=== SUCCESS ==="
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload
