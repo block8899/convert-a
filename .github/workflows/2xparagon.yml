@@ -30,11 +30,9 @@ jobs:
       - name: Merge data & decompose Mish
         run: |
           python3 << 'PYEOF'
-          import onnx, os, numpy as np
+          import onnx, os
           from onnx import helper
-
           model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
-
           new_nodes = []
           for node in model.graph.node:
               if node.op_type == "Mish":
@@ -46,16 +44,14 @@ jobs:
                   new_nodes.append(node)
           del model.graph.node[:]
           model.graph.node.extend(new_nodes)
-
           onnx.save(model, "merged.onnx", save_as_external_data=False)
-          print(f"Saved merged.onnx ({os.path.getsize('merged.onnx')/(1024*1024):.1f} MB)")
+          print(f"merged.onnx: {os.path.getsize('merged.onnx')/(1024*1024):.1f} MB")
           PYEOF
 
       - name: Simplify ONNX
         run: |
           python -m onnxsim merged.onnx model_simplified.onnx \
-            --input-shape "input:1,3,512,512" 2>&1 \
-            || cp merged.onnx model_simplified.onnx
+            --input-shape "input:1,3,512,512" 2>&1 || cp merged.onnx model_simplified.onnx
           ls -lh model_simplified.onnx
 
       - name: Download ncnn tools
@@ -69,287 +65,182 @@ jobs:
       - name: Convert ONNX to NCNN
         run: |
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn model_simplified.onnx raw.param raw.bin 2>&1
+          echo "=== raw.param header ==="
+          head -3 raw.param
+          echo ""
+          echo "=== MemoryData count ==="
+          grep -c "MemoryData" raw.param || echo 0
+          echo ""
+          echo "=== val_24 lines ==="
+          grep "val_24" raw.param || echo "(none)"
           ls -lh raw.param raw.bin
 
-      - name: Rebuild param + bin (fix MemoryData, remove orphans, Split->Crop)
+      - name: Fix param + bin
         run: |
           python3 << 'PYEOF'
-          import re, os, struct, numpy as np, onnx
+          import re, json, os
 
-          onnx_model = onnx.load("merged.onnx")
-          init_map = {i.name: i for i in onnx_model.graph.initializer}
-
-          # Map ONNX Conv/ConvTranspose node -> weight/bias initializer names
-          conv_weight_map = {}
-          conv_bias_map = {}
-          for node in onnx_model.graph.node:
-              if node.op_type in ("Conv", "ConvTranspose"):
-                  conv_weight_map[node.name] = node.input[1]
-                  if len(node.input) > 2:
-                      conv_bias_map[node.name] = node.input[2]
-                  else:
-                      conv_bias_map[node.name] = None
-              elif node.op_type == "ConvInteger":
-                  conv_weight_map[node.name] = node.input[1]
-
-          def get_arr(name):
-              if name in init_map:
-                  return np.array(onnx.numpy_helper.to_array(init_map[name]),
-                                  dtype=np.float32).flatten()
-              return None
-
-          # Split config from ONNX
+          # ── Load split config if exists ──
           blob_split_map = {}
-          for node in onnx_model.graph.node:
-              if node.op_type != "Split":
-                  continue
-              split_sizes = []
-              if len(node.input) > 1 and node.input[1]:
-                  for init in onnx_model.graph.initializer:
-                      if init.name == node.input[1]:
-                          if init.raw_data:
-                              dt = np.int64 if init.data_type == 7 else np.int32
-                              split_sizes = np.frombuffer(init.raw_data, dtype=dt).tolist()
-                          if not split_sizes and list(init.int64_data):
-                              split_sizes = list(init.int64_data)
-                          if not split_sizes and list(init.int32_data):
-                              split_sizes = list(init.int32_data)
-                          break
-              if not split_sizes:
-                  for attr in node.attribute:
-                      if attr.name == "split":
-                          split_sizes = list(attr.ints)
-                          break
-              if split_sizes:
-                  offsets = [0]
-                  for s in split_sizes:
-                      offsets.append(offsets[-1] + int(s))
-                  for i, out_name in enumerate(node.output):
-                      blob_split_map[out_name] = (offsets[i], offsets[i+1])
+          if os.path.exists("split_config.json"):
+              with open("split_config.json") as f:
+                  cfg = json.load(f)
+              for n, info in cfg.items():
+                  for blob, (s, e) in info["outputs"].items():
+                      blob_split_map[blob] = (int(s), int(e))
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          # Read raw.param
-          with open("raw.param", "r") as f:
+          # ── Read raw.bin ──
+          with open("raw.bin", "rb") as f:
+              raw = f.read()
+
+          # ── Parse raw.param to calculate val_24 data size ──
+          # val_24 = MemoryData with 0=4 → 4 floats × 4 bytes = 16 bytes
+          # onnx2ncnn writes MemoryData data sequentially to .bin
+          # val_24 is the first MemoryData → first 16 bytes
+          VAL24_SIZE = 4 * 4  # 16 bytes
+
+          # ── Trim .bin: remove val_24 data from start ──
+          trimmed = raw[VAL24_SIZE:]
+          with open("2xParagonSR_Nano_gan.bin", "wb") as f:
+              f.write(trimmed)
+          print(f"Bin: {len(raw)} -> {len(trimmed)} bytes (removed {VAL24_SIZE}B val_24)")
+
+          # ── Fix .param ──
+          with open("raw.param") as f:
               lines = f.readlines()
 
-          magic  = lines[0]
-          counts = lines[1].strip().split()
-          total_layers = int(counts[0])
-          total_blobs  = int(counts[1])
+          magic = lines[0]
+          lc, bc = lines[1].strip().split()
+          out = [magic, lines[1]]
+          rm = 0
+          add = 0
 
-          # Parse all layers
-          layers = []
           for line in lines[2:]:
-              parts = line.strip().split()
-              if not parts:
-                  continue
-              layers.append(parts)
-
-          # Collect consumed blob names
-          consumed = set()
-          for parts in layers:
-              try:
-                  ni = int(parts[2])
-                  for b in parts[4:4+ni]:
-                      consumed.add(b)
-              except (IndexError, ValueError):
-                  pass
-
-          # Identify unused initializers (orphans)
-          orphan_inits = set()
-          for init in onnx_model.graph.initializer:
-              if init.name not in consumed:
-                  orphan_inits.add(init.name)
-
-          # Build new .param + .bin
-          new_param_lines = [magic, lines[1]]
-          new_bin = bytearray()
-          removed = 0
-          added = 0
-
-          def write_floats(arr):
-              while len(new_bin) % 4 != 0:
-                  new_bin.append(0)
-              offset = len(new_bin)
-              new_bin.extend(arr.astype(np.float32).tobytes())
-              return offset, len(arr) * 4
-
-          for parts in layers:
-              op   = parts[0]
-              name = parts[1]
-
-              # Remove orphan MemoryData (e.g. val_24)
-              if op == "MemoryData" and name in orphan_inits:
-                  removed += 1
-                  print(f"  Removed orphan: {op} {name}")
+              p = line.strip().split()
+              if not p:
+                  out.append(line)
                   continue
 
-              # Remove orphan Split (e.g. splitncnn_0)
-              if op == "Split":
-                  try:
-                      no = int(parts[3])
-                      out_blobs = parts[4+int(parts[2]):4+int(parts[2])+no]
-                      if all(b.split("_splitncnn_")[0] in orphan_inits for b in out_blobs):
-                          removed += 1
-                          print(f"  Removed orphan: {op} {name}")
-                          continue
-                  except (IndexError, ValueError):
-                      pass
+              op, nm = p[0], p[1]
 
-              # Fix MemoryData: write data to .bin with offset+size
-              if op == "MemoryData":
-                  try:
-                      out_blob = parts[4]
-                      w = h = d = c = 1
-                      for p in parts[5:]:
-                          if "=" in p:
-                              k, v = p.split("=", 1)
-                              ki = int(k)
-                              if   ki == 0: w = int(v)
-                              elif ki == 1: h = int(v)
-                              elif ki == 2: d = int(v)
-                              elif ki == 3: c = int(v)
-                      total = w * h * d * c
-                      arr = get_arr(name)
-                      if arr is not None and len(arr) == total:
-                          off, sz = write_floats(arr)
-                          new_param_lines.append(
-                              f"MemoryData {name} 0 1 {out_blob}"
-                              f" 0={w} 1={h} 2={d} 3={c}"
-                              f" 10={off} 11={sz}\n"
-                          )
-                          print(f"  Fixed MemoryData: {name} ({total}f, off={off})")
-                          continue
-                      else:
-                          removed += 1
-                          print(f"  Removed (no data): {name}")
-                          continue
-                  except Exception as e:
-                      removed += 1
-                      print(f"  Removed (error {name}): {e}")
-                      continue
+              # ── Remove: MemoryData val_24 (orphan, data trimmed from .bin) ──
+              if op == "MemoryData" and nm == "val_24":
+                  rm += 1
+                  print(f"  Removed: MemoryData val_24")
+                  continue
 
-              # Dynamic Split/Slice -> static Crop
+              # ── Remove: Split splitncnn_0 (consumes val_24, orphan) ──
+              if op == "Split" and nm == "splitncnn_0":
+                  rm += 1
+                  print(f"  Removed: Split splitncnn_0")
+                  continue
+
+              # ── Dynamic Split/Slice → static Crop ──
               if op in ("Slice", "Split"):
                   try:
-                      ni = int(parts[2])
-                      no = int(parts[3])
+                      ni, no = int(p[2]), int(p[3])
                   except (IndexError, ValueError):
-                      new_param_lines.append(" ".join(parts) + "\n")
+                      out.append(line)
                       continue
                   if ni > 1:
-                      in_blobs  = parts[4:4+ni]
-                      out_blobs = parts[4+ni:4+ni+no]
-                      data_blob = in_blobs[0]
-                      for i, ob in enumerate(out_blobs):
-                          if ob in blob_split_map:
-                              s, e = blob_split_map[ob]
+                      ib = p[4:4+ni]
+                      ob = p[4+ni:4+ni+no]
+                      for i, o in enumerate(ob):
+                          s = e = None
+                          if o in blob_split_map:
+                              s, e = blob_split_map[o]
                           else:
-                              idx = -1
-                              m = re.search(r"_(\d+)$", ob)
-                              if m: idx = int(m.group(1))
-                              if idx not in FALLBACK: idx = i
+                              m = re.search(r"_(\d+)$", o)
+                              idx = int(m.group(1)) if m else i
                               if idx in FALLBACK:
                                   s, e = FALLBACK[idx]
-                              else:
-                                  new_param_lines.append(" ".join(parts) + "\n")
-                                  continue
-                          nc = e - s
-                          if nc <= 0:
-                              new_param_lines.append(" ".join(parts) + "\n")
-                              continue
-                          new_param_lines.append(
-                              f"Crop            {name}_{i} 1 1 {data_blob} {ob}"
-                              f" 2={s} 6={nc}\n"
-                          )
-                          added += 1
-                      removed += 1
-                      print(f"  Replaced '{name}' -> {no} Crop")
+                          if s is not None and e > s:
+                              nc = e - s
+                              out.append(
+                                  f"Crop {nm}_{i} 1 1 {ib[0]} {o}"
+                                  f" 2={s} 6={nc}\n"
+                              )
+                              add += 1
+                          else:
+                              out.append(line)
+                      rm += 1
+                      print(f"  Replaced '{nm}' -> {no} Crop")
                       continue
 
-              # Convolution/ConvolutionDepthWise: write weights+bias to .bin
-              if op in ("Convolution", "ConvolutionDepthWise"):
-                  wname = conv_weight_map.get(name)
-                  bname = conv_bias_map.get(name, None)
-                  w_arr = get_arr(wname) if wname else None
-                  b_arr = get_arr(bname) if bname else None
-                  has_bias = b_arr is not None
-
-                  if w_arr is not None:
-                      w_off, w_sz = write_floats(w_arr)
-                      if has_bias:
-                          b_off, b_sz = write_floats(b_arr)
-
-                      # Update param: set 6=weight_data_size, 5=1 for bias
-                      new_parts = list(parts)
-                      new_parts.append(f"6={w_sz}")
-                      if has_bias:
-                          new_parts.append("5=1")
-                      new_param_lines.append(" ".join(new_parts) + "\n")
-                      print(f"  Fixed {op}: {name} (w={w_sz}B"
-                            f"{', bias=' + str(b_sz) + 'B' if has_bias else ''})")
-                  else:
-                      new_param_lines.append(" ".join(parts) + "\n")
-                      print(f"  WARNING: no weight data for {name}")
-                  continue
-
-              # DepthToSpace -> PixelShuffle
+              # ── DepthToSpace → PixelShuffle ──
               if op == "DepthToSpace":
-                  line = " ".join(parts)
                   line = line.replace("DepthToSpace", "PixelShuffle")
                   if " 0=" not in line:
-                      line += " 0=2"
-                  new_param_lines.append(line + "\n")
-                  print(f"  DepthToSpace -> PixelShuffle: {name}")
-                  continue
+                      line = line.rstrip() + " 0=2\n"
 
-              # Keep all other layers as-is
-              new_param_lines.append(" ".join(parts) + "\n")
+              out.append(line)
 
-          # Update header
-          final_layers = total_layers - removed + added
-          new_param_lines[1] = f"{final_layers} {total_blobs}\n"
+          # ── Update header ──
+          new_lc = int(lc) - rm + add
+          out[1] = f"{new_lc} {bc}\n"
 
-          # Write output files
           with open("2xParagonSR_Nano_gan.param", "w") as f:
-              f.writelines(new_param_lines)
-          with open("2xParagonSR_Nano_gan.bin", "wb") as f:
-              f.write(new_bin)
+              f.writelines(out)
 
-          print(f"\n✅ Removed {removed}, Added {added}")
-          print(f"✅ Layers: {total_layers} -> {final_layers}")
-          print(f"✅ Bin: {len(new_bin)} bytes ({len(new_bin)/(1024*1024):.1f} MB)")
+          print(f"\nRemoved {rm}, Added {add}, Layers: {lc} -> {new_lc}")
+
+          # ── Verify no val_24 or splitncnn_0 ──
+          with open("2xParagonSR_Nano_gan.param") as f:
+              txt = f.read()
+          assert "val_24" not in txt, "ERROR: val_24 still in param!"
+          assert "splitncnn_0" not in txt, "ERROR: splitncnn_0 still in param!"
+          print("Verified: no val_24, no splitncnn_0")
           PYEOF
 
-      - name: Optimize NCNN
+      - name: Optimize NCNN (fuse MemoryData -> Scale)
         run: |
-          NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
+          NCNNOPT=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
 
-          if $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
+          echo "=== Before optimize ==="
+          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+
+          if $NCNNOPT 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
                optimized.param optimized.bin 0; then
             mv optimized.param 2xParagonSR_Nano_gan.param
-            mv optimized.bin   2xParagonSR_Nano_gan.bin
-            echo "✅ ncnnoptimize OK"
+            mv optimized.bin 2xParagonSR_Nano_gan.bin
+            echo ""
+            echo "=== After optimize ==="
+            echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+            echo "✅ ncnnoptimize OK - MemoryData fused into Scale"
           else
-            echo "⚠️ ncnnoptimize failed, using pre-optimized model"
+            echo "❌ ncnnoptimize failed"
+            exit 1
           fi
 
-      - name: Validate
+      - name: Validate final
         run: |
-          echo "=== Param Header ==="
-          head -3 2xParagonSR_Nano_gan.param
+          echo "=== Final Param ==="
+          head -5 2xParagonSR_Nano_gan.param
           echo ""
-          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param 2>/dev/null || echo 0)"
-          echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
+
+          MD=$(grep -c "MemoryData" 2xParagonSR_Nano_gan.param 2>/dev/null || echo "0")
+          INPUTS=$(grep -c "^Input" 2xParagonSR_Nano_gan.param)
+          echo "MemoryData: $MD"
+          echo "Input layers: $INPUTS"
           echo ""
+
+          if [ "$MD" -gt 0 ]; then
+            echo "WARNING: MemoryData still present"
+          fi
+          if [ "$INPUTS" -ne 1 ]; then
+            echo "ERROR: Expected 1 Input, got $INPUTS"
+            exit 1
+          fi
+
           echo "=== Layer summary ==="
           awk 'NR>2 {print $1}' 2xParagonSR_Nano_gan.param | sort | uniq -c | sort -rn
-          echo ""
 
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
           [ "$BIN_SIZE" -lt 100000 ] && echo "ERROR: .bin too small!" && exit 1
 
+          echo ""
           echo "=== SUCCESS ==="
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
