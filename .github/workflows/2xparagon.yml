@@ -51,7 +51,6 @@ jobs:
         run: |
           python -m onnxsim merged.onnx model_simplified.onnx \
             --input-shape "input:1,3,512,512" 2>&1 || cp merged.onnx model_simplified.onnx
-          ls -lh model_simplified.onnx
 
       - name: Download ncnn tools
         run: |
@@ -66,70 +65,70 @@ jobs:
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn model_simplified.onnx raw.param raw.bin 2>&1
           ls -lh raw.param raw.bin
 
-      - name: Fix ALL issues
+      - name: Fix ALL issues (single script)
         run: |
           python3 << 'PYEOF'
-          import re, os, math
-          import onnx
-          import numpy as np
+          import re, os
 
-          # ── 1. Extract kernel shapes from ONNX ──
-          onnx_model = onnx.load("model_simplified.onnx")
-          kernel_map = {}
-          for node in onnx_model.graph.node:
-              if node.op_type in ("Conv", "ConvTranspose"):
-                  for attr in node.attribute:
-                      if attr.name == "kernel_shape":
-                          shape = list(attr.ints)
-                          # ONNX: [H, W] -> NCNN: 1=W, 11=H
-                          kernel_map[node.name] = (shape[-1], shape[0])
-                          break
-          print(f"Extracted {len(kernel_map)} kernel shapes from ONNX")
+          FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          # ── 2. Parse raw.param ──
           with open("raw.param") as f:
               lines = f.readlines()
 
-          # ── 3. Find val_24 position in .bin ──
-          bin_pos = 0
-          val24_pos = None
+          # ══════════════════════════════════════════════════
+          # STEP 1: Calculate val_24 position in .bin
+          # ══════════════════════════════════════════════════
+          bin_offset = 0
+          val24_off = None
           val24_sz = None
+
           for line in lines[2:]:
               p = line.strip().split()
-              if not p or p[0] != "MemoryData":
+              if not p:
                   continue
-              w = h = d = c = 1
-              for pp in p[5:]:
-                  if "=" in pp:
-                      k, v = pp.split("=", 1)
-                      ki = int(k)
-                      if   ki == 0: w = int(v)
-                      elif ki == 1: h = int(v)
-                      elif ki == 2: d = int(v)
-                      elif ki == 3: c = int(v)
-              sz = w * h * d * c * 4
-              if p[1] == "val_24":
-                  val24_pos = bin_pos
-                  val24_sz = sz
-              bin_pos += sz
-          print(f"val_24 in .bin: offset={val24_pos}, size={val24_sz}")
+              # MemoryData writes data sequentially to .bin
+              if p[0] == "MemoryData":
+                  w = h = d = c = 1
+                  for pp in p[5:]:
+                      if "=" in pp:
+                          k, v = pp.split("=", 1)
+                          ki = int(k)
+                          if   ki == 0: w = int(v)
+                          elif ki == 1: h = int(v)
+                          elif ki == 2: d = int(v)
+                          elif ki == 3: c = int(v)
+                  sz = w * h * d * c * 4  # bytes
+                  if p[1] == "val_24":
+                      val24_off = bin_offset
+                      val24_sz = sz
+                  bin_offset += sz
+              # Convolution writes AFTER all MemoryData
+              elif p[0] in ("Convolution", "ConvolutionDepthWise"):
+                  break
 
-          # ── 4. Trim .bin ──
+          print(f"val_24: offset={val24_off}, size={val24_sz}")
+
+          # ══════════════════════════════════════════════════
+          # STEP 2: Trim val_24 from .bin
+          # ══════════════════════════════════════════════════
           with open("raw.bin", "rb") as f:
               raw = f.read()
-          if val24_pos is not None:
-              new_bin = raw[:val24_pos] + raw[val24_pos + val24_sz:]
+
+          if val24_off is not None and val24_sz:
+              new_bin = raw[:val24_off] + raw[val24_off + val24_sz:]
           else:
               new_bin = raw
+
           with open("2xParagonSR_Nano_gan.bin", "wb") as f:
               f.write(new_bin)
           print(f"Bin: {len(raw)} -> {len(new_bin)} bytes")
 
-          # ── 5. Fix .param ──
-          FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
+          # ══════════════════════════════════════════════════
+          # STEP 3: Fix .param
+          # ══════════════════════════════════════════════════
           lc, bc = lines[1].strip().split()
           out = [lines[0], lines[1]]
-          rm = 0; add = 0
+          rm = 0; add = 0; kernel_fix = 0
 
           for line in lines[2:]:
               p = line.strip().split()
@@ -138,15 +137,13 @@ jobs:
                   continue
               op, nm = p[0], p[1]
 
-              # Remove val_24
+              # ── Remove val_24 + splitncnn_0 ──
               if op == "MemoryData" and nm == "val_24":
                   rm += 1; continue
-
-              # Remove splitncnn_0
               if op == "Split" and nm == "splitncnn_0":
                   rm += 1; continue
 
-              # Dynamic Split/Slice -> static Crop
+              # ── Dynamic Split → static Crop ──
               if op in ("Slice", "Split"):
                   try:
                       ni, no = int(p[2]), int(p[3])
@@ -167,7 +164,7 @@ jobs:
                               out.append(line)
                       rm += 1; continue
 
-              # ★ FIX: Add missing kernel params for Conv/ConvDW
+              # ── ★ FIX: Add kernel params to ALL Conv/ConvDW ──
               if op in ("Convolution", "ConvolutionDepthWise"):
                   params = {}
                   for pp in p[5:]:
@@ -175,33 +172,40 @@ jobs:
                           k, v = pp.split("=", 1)
                           try: params[int(k)] = int(v)
                           except: pass
-                  if 1 not in params:
-                      kw = kh = 0
-                      # Try ONNX kernel_map
-                      if nm in kernel_map:
-                          kw, kh = kernel_map[nm]
-                      elif op == "ConvolutionDepthWise":
-                          # Infer: weight_data_size / group = kh * kw
-                          ws = params.get(6, 0)
-                          grp = params.get(7, 1)
-                          if ws > 0 and grp > 0:
-                              ksq = ws // grp
-                              ks = int(math.sqrt(ksq))
-                              if ks * ks == ksq:
-                                  kw = kh = ks
-                              else:
-                                  # Non-square: use padding hints
-                                  pl = params.get(4, 0)
-                                  pr = params.get(15, 0)
-                                  pt = params.get(14, 0)
-                                  pb = params.get(16, 0)
-                                  kw = pl + pr + 1 if (pl + pr) > 0 else 1
-                                  kh = pt + pb + 1 if (pt + pb) > 0 else 1
-                      if kw > 0 and kh > 0:
-                          line = line.rstrip() + f" 1={kw} 11={kh}\n"
-                          print(f"  Added kernel: {nm} 1={kw} 11={kh}")
 
-              # DepthToSpace -> PixelShuffle
+                  if 1 not in params:
+                      # Infer kernel from padding
+                      pl = params.get(4, 0)
+                      pt = params.get(14, 0)
+                      pr = params.get(15, 0)
+                      pb = params.get(16, 0)
+                      kw = pl + pr + 1
+                      kh = pt + pb + 1
+                      # Insert 1= and 11= BEFORE other params
+                      # Rebuild line cleanly (no duplicates)
+                      head = p[:5]  # Type Name NumIn NumOut
+                      tail = p[5:]  # blobs + params
+                      # Remove any existing 1= or 11= (shouldn't exist but safe)
+                      clean_tail = [x for x in tail if not x.startswith("1=") and not x.startswith("11=")]
+                      # Build: head + blobs + kernel_params + other_params
+                      # Blobs are before first "=" param
+                      blob_part = []
+                      param_part = []
+                      for x in clean_tail:
+                          if "=" in x and not blob_part:
+                              # Wait, blobs don't have "="
+                              pass
+                          if "=" in x:
+                              param_part.append(x)
+                          else:
+                              blob_part.append(x)
+                      # Reconstruct: Type Name NumIn NumOut blobs 1=kw 11=kh other_params
+                      newline = " ".join(head + blob_part) + f" 1={kw} 11={kh} " + " ".join(param_part) + "\n"
+                      out.append(newline)
+                      kernel_fix += 1
+                      continue
+
+              # ── DepthToSpace → PixelShuffle ──
               if op == "DepthToSpace":
                   line = line.replace("DepthToSpace", "PixelShuffle")
                   if " 0=" not in line:
@@ -212,24 +216,31 @@ jobs:
           out[1] = f"{int(lc)-rm+add} {bc}\n"
           with open("2xParagonSR_Nano_gan.param", "w") as f:
               f.writelines(out)
-          print(f"\nRemoved {rm}, Added {add}, Layers: {lc} -> {int(lc)-rm+add}")
+
+          print(f"\nRemoved {rm}, Added {add} Crop, Fixed kernel: {kernel_fix}")
           PYEOF
 
-      - name: Debug - check kernel params
+      - name: Debug - verify
         run: |
-          echo "=== Conv/ConvDW layers with kernel params ==="
-          grep -E "^(Convolution|ConvolutionDepthWise)" 2xParagonSR_Nano_gan.param | head -5
+          echo "=== Conv WITHOUT kernel (should be empty) ==="
+          grep -E "^Convolution\b" 2xParagonSR_Nano_gan.param | grep -v " 1=" | head -3 || echo "(none - all fixed)"
           echo ""
-          echo "=== MemoryData count ==="
+          echo "=== ConvDW WITHOUT kernel (should be empty) ==="
+          grep "^ConvolutionDepthWise" 2xParagonSR_Nano_gan.param | grep -v " 1=" | head -3 || echo "(none - all fixed)"
+          echo ""
+          echo "=== MemoryData ==="
           grep -c "MemoryData" 2xParagonSR_Nano_gan.param || echo "0"
 
       - name: Optimize NCNN
         run: |
           NCNNOPT=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
+          echo "MemoryData before: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+
           if $NCNNOPT 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
                optimized.param optimized.bin 0; then
             mv optimized.param 2xParagonSR_Nano_gan.param
             mv optimized.bin 2xParagonSR_Nano_gan.bin
+            echo "MemoryData after: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
             echo "✅ ncnnoptimize OK"
           else
             echo "❌ ncnnoptimize failed"
