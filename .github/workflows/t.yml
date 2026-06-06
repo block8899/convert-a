@@ -1,0 +1,59 @@
+name: Merge ONNX
+
+on:
+  workflow_dispatch:
+
+jobs:
+  merge:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: pip install onnx numpy
+
+      - name: Download ONNX files
+        run: |
+          wget -q -O net_g_75000_fused_op18_fp32.onnx \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
+          wget -q -O net_g_75000_fused_op18_fp32.onnx.data \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
+          ls -lh net_g_75000_fused_op18_fp32.*
+
+      - name: Merge into single ONNX
+        run: |
+          python3 << 'PYEOF'
+          import onnx, os
+
+          model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
+          onnx.save(model, "2xParagonSR_Nano_gan.onnx", save_as_external_data=False)
+
+          size = os.path.getsize("2xParagonSR_Nano_gan.onnx")
+          print(f"✅ Merged: {size/(1024*1024):.1f} MB")
+          PYEOF
+
+      - name: Validate
+        run: |
+          python3 -c "
+          import onnx
+          m = onnx.load('2xParagonSR_Nano_gan.onnx')
+          print(f'Opset: {m.opset_import[0].version}')
+          print(f'Inputs: {[i.name for i in m.graph.input]}')
+          print(f'Outputs: {[o.name for o in m.graph.output]}')
+          print(f'Nodes: {len(m.graph.node)}')
+          print(f'Initializers: {len(m.graph.initializer)}')
+          "
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2xParagonSR_Nano_gan_onnx
+          path: 2xParagonSR_Nano_gan.onnx
+          retention-days: 1
