@@ -159,12 +159,11 @@ jobs:
           grep "DepthToSpace" raw.param || echo "(none)"
 
       # ── Auto-Fix: Sử dụng split_config.json thay vì hardcode ──
-      - name: Auto-Fix NCNN Param (Dynamic Split → Static Crop)
+      - name: Auto-Fix NCNN Param (Dynamic Split -> Static Crop)
         run: |
           python3 << 'PYEOF'
           import re, json, os
 
-          # ── Load dynamic split config từ ONNX ──
           blob_split_map = {}
           if os.path.exists('split_config.json'):
               with open('split_config.json') as f:
@@ -176,7 +175,6 @@ jobs:
           else:
               print("WARNING: split_config.json not found, using fallback only")
 
-          # Fallback map theo index (trường hợp không trích xuất được từ ONNX)
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
           def fix_ncnn_param(input_file, output_file):
@@ -215,12 +213,10 @@ jobs:
                           data_blob = input_blobs[0]
 
                           for i, out_blob in enumerate(output_blobs):
-                              # Ưu tiên: dùng mapping từ ONNX
                               if out_blob in blob_split_map:
                                   start, end = blob_split_map[out_blob]
                                   source = "ONNX"
                               else:
-                                  # Fallback: đoán từ index
                                   idx = -1
                                   match = re.search(r'_(\d+)$', out_blob)
                                   if match:
@@ -253,13 +249,13 @@ jobs:
                               )
                               new_lines.append(static_line)
                               added += 1
-                              print(f"  Crop {name}_{i}: [{start}:{end}] ncrop={ncrop} ({source})")
+                              print(f"  Crop {node_name}_{i}: [{start}:{end}] ncrop={ncrop} ({source})")
+                              #       ^^^^^^^^^^  đã sửa: name → node_name
 
                           removed += 1
-                          print(f"  Replaced dynamic '{op_type}' '{node_name}' → {num_outputs} Crop")
+                          print(f"  Replaced dynamic '{op_type}' '{node_name}' -> {num_outputs} Crop")
                           continue
 
-                  # Giữ nguyên node khác
                   new_lines.append(line)
 
               new_layer_count = layer_count - removed + added
@@ -268,7 +264,7 @@ jobs:
               with open(output_file, 'w') as f:
                   f.writelines(new_lines)
 
-              print(f"\n✅ Replaced {removed} dynamic nodes → {added} static Crop nodes")
+              print(f"\n✅ Replaced {removed} dynamic nodes -> {added} static Crop nodes")
 
           fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
