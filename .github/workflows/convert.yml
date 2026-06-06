@@ -16,19 +16,29 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 📦 Install deps
+      - name: 📦 Install Python deps
         run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
           pip install packaging safetensors
           pip install spandrel onnx onnxsim
-          sudo apt-get update && sudo apt-get install -y cmake build-essential
 
       - name: 🔧 Build PNNX
         run: |
+          sudo apt-get update && sudo apt-get install -y cmake build-essential
+          
+          # 1. Tải LibTorch C++ (Bắt buộc để PNNX chạy)
+          wget -q https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.3.1%2Bcpu.zip
+          unzip -qq libtorch-cxx11-abi-shared-with-deps-2.3.1+cpu.zip -d /tmp
+          
+          # 2. Compile PNNX
           git clone --depth 1 https://github.com/nihui/pnnx.git /tmp/pnnx
           cd /tmp/pnnx && mkdir build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) pnnx
+          cmake -DCMAKE_PREFIX_PATH=/tmp/libtorch ..
+          make -j$(nproc)
+          
+          # 3. Đưa PNNX và LibTorch vào môi trường
           echo "/tmp/pnnx/build" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=/tmp/libtorch/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
       - name: ⬇️ Download PTH
         run: |
@@ -44,6 +54,7 @@ jobs:
           model = arch.model.eval()
           dummy = torch.randn(1, 3, 64, 64)
 
+          # ONNX
           torch.onnx.export(
               model, dummy, "model.onnx",
               opset_version=17,
@@ -52,9 +63,10 @@ jobs:
               dynamic_axes={"input": {0: "batch", 2: "h", 3: "w"}, "output": {0: "batch", 2: "h", 3: "w"}},
               dynamo=False
           )
-          # SỬA Ở ĐÂY: architecture_name -> architecture
-          print(f"ONNX exported | {arch.architecture} | {arch.scale}x")
+          # Đã sửa lỗi crash: bỏ arch.architecture_name
+          print(f"ONNX exported | Scale: {arch.scale}x")
 
+          # TorchScript cho PNNX
           with torch.no_grad():
               torch.jit.trace(model, dummy).save("model.pt")
           print("TorchScript exported")
@@ -65,9 +77,16 @@ jobs:
       - name: 🔄 PNNX → NCNN
         run: |
           pnnx model.pt inputshape=[1,3,64,64]
-          mv model.ncnn.param 2xPublic_realplksr_dysample_layernorm_real.ncnn.param
-          mv model.ncnn.bin   2xPublic_realplksr_dysample_layernorm_real.ncnn.bin
-          ls -lh *.onnx *.ncnn.*
+          
+          if [ -f "model.ncnn.param" ]; then
+            mv model.ncnn.param 2xPublic_realplksr_dysample_layernorm_real.ncnn.param
+            mv model.ncnn.bin   2xPublic_realplksr_dysample_layernorm_real.ncnn.bin
+            echo "✅ NCNN conversion successful!"
+            ls -lh *.ncnn.*
+          else
+            echo "❌ PNNX failed"
+            exit 1
+          fi
 
       - name: 📤 Upload
         uses: actions/upload-artifact@v4
