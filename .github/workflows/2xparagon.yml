@@ -170,9 +170,9 @@ jobs:
               for node_name, info in cfg.items():
                   for blob, (s, e) in info['outputs'].items():
                       blob_split_map[blob] = (int(s), int(e))
-              print(f"Loaded {len(blob_split_map)} blob→channel_range entries from ONNX")
+              print(f"Loaded {len(blob_split_map)} blob→channel_range entries")
           else:
-              print("WARNING: split_config.json not found, using fallback only")
+              print("WARNING: split_config.json not found, fallback only")
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
@@ -195,11 +195,24 @@ jobs:
                       new_lines.append(line)
                       continue
 
-                  op_type = parts[0]
+                  op_type   = parts[0]
+                  node_name = parts[1]
 
+                  # ── Xóa MemoryData val_24 (mồ côi) ──
+                  if op_type == 'MemoryData' and node_name == 'val_24':
+                      removed += 1
+                      print(f"  Removed orphan: MemoryData val_24")
+                      continue
+
+                  # ── Xóa Split splitncnn_0 (mồ côi, chia val_24) ──
+                  if op_type == 'Split' and node_name == 'splitncnn_0':
+                      removed += 1
+                      print(f"  Removed orphan: Split splitncnn_0")
+                      continue
+
+                  # ── Dynamic Split/Slice → static Crop ──
                   if op_type in ['Slice', 'Split']:
                       try:
-                          node_name   = parts[1]
                           num_inputs  = int(parts[2])
                           num_outputs = int(parts[3])
                       except (IndexError, ValueError):
@@ -209,12 +222,11 @@ jobs:
                       if num_inputs > 1:
                           input_blobs  = parts[4 : 4 + num_inputs]
                           output_blobs = parts[4 + num_inputs : 4 + num_inputs + num_outputs]
-                          data_blob = input_blobs[0]
+                          data_blob    = input_blobs[0]
 
                           for i, out_blob in enumerate(output_blobs):
                               if out_blob in blob_split_map:
                                   start, end = blob_split_map[out_blob]
-                                  source = "ONNX"
                               else:
                                   idx = -1
                                   match = re.search(r'_(\d+)$', out_blob)
@@ -224,20 +236,16 @@ jobs:
                                       idx = i
                                   if idx in FALLBACK:
                                       start, end = FALLBACK[idx]
-                                      source = "FALLBACK"
                                   else:
-                                      print(f"  SKIP: cannot determine range for '{out_blob}'")
                                       new_lines.append(line)
                                       continue
 
                               ncrop = end - start
                               if ncrop <= 0:
-                                  print(f"  ERROR: ncrop={ncrop} for '{out_blob}'")
                                   new_lines.append(line)
                                   continue
 
-                              # ★ SỬA: dùng 2=start 5=end (channel dimension)
-                              #   KHÔNG dùng 3= vì 3 là width end
+                              # ★ 2=coffset  6=outc (số channel crop)
                               static_line = (
                                   f"Crop"
                                   f"            {node_name}_{i}"
@@ -245,16 +253,15 @@ jobs:
                                   f" {data_blob}"
                                   f" {out_blob}"
                                   f" 2={start}"
-                                  f" 5={end}\n"
+                                  f" 6={ncrop}\n"
                               )
                               new_lines.append(static_line)
                               added += 1
                               print(f"  Crop {node_name}_{i}: "
-                                    f"c[{start}:{end}] ({ncrop}ch, {source})")
+                                    f"coffset={start} outc={ncrop}")
 
                           removed += 1
-                          print(f"  Replaced dynamic '{op_type}' '{node_name}' "
-                                f"-> {num_outputs} Crop")
+                          print(f"  Replaced '{node_name}' → {num_outputs} Crop")
                           continue
 
                   new_lines.append(line)
@@ -265,7 +272,7 @@ jobs:
               with open(output_file, 'w') as f:
                   f.writelines(new_lines)
 
-              print(f"\n✅ Replaced {removed} dynamic nodes -> {added} static Crop nodes")
+              print(f"\n✅ Removed {removed} nodes, added {added} Crop nodes")
 
           fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
