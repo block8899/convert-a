@@ -1,0 +1,89 @@
+name: Convert RealPLKSR to NCNN
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/convert_to_ncnn.yml'
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+
+    env:
+      MODEL_NAME: 2xPublic_realplksr_dysample_layernorm_real
+      ONNX_URL: https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real_fp32_op17.onnx
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. Tải file ONNX có sẵn ──────────────────────────────────────────
+      - name: Download ONNX model
+        run: |
+          mkdir -p models output_ncnn
+          wget -q "$ONNX_URL" -O "models/${MODEL_NAME}.onnx"
+          echo "Downloaded: $(du -sh models/${MODEL_NAME}.onnx)"
+
+      # ── 2. Cài onnxsim để simplify (phòng khi ncnn không hiểu op) ────────
+      - name: Set up Python & onnxsim
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install onnxsim
+        run: pip install onnxsim onnx
+
+      - name: Simplify ONNX
+        run: |
+          python -m onnxsim \
+            "models/${MODEL_NAME}.onnx" \
+            "models/${MODEL_NAME}_sim.onnx" \
+            --input-shape "input:1,3,64,64" || \
+          cp "models/${MODEL_NAME}.onnx" "models/${MODEL_NAME}_sim.onnx"
+          echo "Simplified size: $(du -sh models/${MODEL_NAME}_sim.onnx)"
+
+      # ── 3. Cài ncnn tools ─────────────────────────────────────────────────
+      - name: Install NCNN tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wget unzip
+
+          NCNN_VER=$(curl -s https://api.github.com/repos/Tencent/ncnn/releases/latest \
+                     | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Using ncnn $NCNN_VER"
+
+          wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/ncnn-${NCNN_VER}-ubuntu-2204.zip" \
+               -O ncnn.zip
+          unzip -q ncnn.zip
+          echo "$PWD/ncnn-${NCNN_VER}-ubuntu-2204/bin" >> $GITHUB_PATH
+
+      # ── 4. Convert ONNX → NCNN (fp32) ─────────────────────────────────────
+      - name: Convert ONNX → NCNN fp32
+        run: |
+          onnx2ncnn \
+            "models/${MODEL_NAME}_sim.onnx" \
+            "output_ncnn/${MODEL_NAME}_fp32.param" \
+            "output_ncnn/${MODEL_NAME}_fp32.bin"
+          echo "fp32 sizes: $(du -sh output_ncnn/*)"
+
+      # ── 5. Tối ưu sang fp16 ───────────────────────────────────────────────
+      - name: Optimize → NCNN fp16
+        run: |
+          ncnnoptimize \
+            "output_ncnn/${MODEL_NAME}_fp32.param" \
+            "output_ncnn/${MODEL_NAME}_fp32.bin" \
+            "output_ncnn/${MODEL_NAME}_fp16.param" \
+            "output_ncnn/${MODEL_NAME}_fp16.bin" \
+            65536
+          echo "fp16 sizes: $(du -sh output_ncnn/*)"
+
+      # ── 6. Upload artifacts ───────────────────────────────────────────────
+      - name: Upload NCNN models
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MODEL_NAME }}_ncnn
+          path: output_ncnn/
+          retention-days: 30
