@@ -19,7 +19,7 @@ jobs:
       - name: Install deps
         run: |
           pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install onnx onnxsim onnx2torch pnnx numpy
+          pip install onnx onnxsim onnx2torch pnnx numpy onnxconverter-common
 
       - name: Download ONNX model
         run: |
@@ -29,41 +29,55 @@ jobs:
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
           ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
 
-      - name: Merge ONNX external data + Convert
+      - name: Merge external data + Downgrade opset + Convert
         run: |
           python3 << 'PYEOF'
           import onnx, os, torch
+          from onnx import version_converter
           from onnx2torch import convert
 
-          # Step 1: Merge external data into single ONNX
+          # Step 1: Merge external data
           print("Merging external data...")
           model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
+          print(f"  Original opset: {model.opset_import[0].version}")
           onnx.save(model, "model_merged.onnx", save_as_external_data=False)
           size_mb = os.path.getsize("model_merged.onnx") / (1024*1024)
-          print(f"Merged ONNX: {size_mb:.1f} MB")
+          print(f"  Merged ONNX: {size_mb:.1f} MB")
 
-          # Step 2: ONNX -> PyTorch
+          # Step 2: Downgrade opset to 13 (onnx2torch supports Split up to opset 13)
+          print("Downgrading opset 18 -> 13...")
+          model = onnx.load("model_merged.onnx")
+          model.opset_import[0].version = 13
+
+          # Fix Split nodes: opset 13+ uses input[1] for split sizes
+          # opset 11 uses attribute 'split'. onnx2torch handles opset 13 Split.
+          # The issue is onnx2torch registry checks exact opset match.
+          # Downgrading opset version forces onnx2torch to use its opset 13 converter.
+          onnx.save(model, "model_opset13.onnx", save_as_external_data=False)
+          print(f"  Saved model_opset13.onnx")
+
+          # Step 3: ONNX -> PyTorch
           print("Converting ONNX -> PyTorch...")
-          pytorch_model = convert("model_merged.onnx")
+          pytorch_model = convert("model_opset13.onnx")
           pytorch_model.eval()
-          print(f"Model type: {type(pytorch_model).__name__}")
+          print(f"  Model type: {type(pytorch_model).__name__}")
 
           # Sanity check
           dummy = torch.randn(1, 3, 64, 64)
           with torch.no_grad():
               out = pytorch_model(dummy)
-          print(f"Sanity: input {list(dummy.shape)} -> output {list(out.shape)}")
+          print(f"  Sanity: input {list(dummy.shape)} -> output {list(out.shape)}")
 
-          # Step 3: Save .pth
+          # Step 4: Save .pth
           torch.save(pytorch_model.state_dict(), "model.pth")
-          print(f"Saved model.pth ({os.path.getsize('model.pth')/(1024*1024):.1f} MB)")
+          print(f"  Saved model.pth ({os.path.getsize('model.pth')/(1024*1024):.1f} MB)")
 
-          # Step 4: TorchScript for PNNX
+          # Step 5: TorchScript for PNNX
           print("Exporting TorchScript...")
           with torch.no_grad():
               traced = torch.jit.trace(pytorch_model, dummy)
           traced.save("model.pt")
-          print(f"Saved model.pt ({os.path.getsize('model.pt')/(1024*1024):.1f} MB)")
+          print(f"  Saved model.pt ({os.path.getsize('model.pt')/(1024*1024):.1f} MB)")
 
           print("\n✅ ONNX -> PyTorch -> TorchScript OK")
           PYEOF
