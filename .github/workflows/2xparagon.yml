@@ -27,8 +27,7 @@ jobs:
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
           ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
 
-      # ── BƯỚC MỚI: Trích xuất split info từ ONNX TRƯỚC KHI simplify ──
-      - name: Merge data, decompose Mish & extract split config
+      - name: Merge data, decompose Mish, extract split config
         run: |
           python3 << 'PYEOF'
           import onnx, json, os, numpy as np
@@ -38,35 +37,29 @@ jobs:
           model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
           print("External data merged OK")
 
-          # ── Decompose Mish → Softplus + Tanh + Mul ──
+          # Decompose Mish -> Softplus + Tanh + Mul
           new_nodes = []
           mish_count = 0
           for node in model.graph.node:
               if node.op_type == "Mish":
                   mish_count += 1
-                  x  = node.input[0]
-                  y  = node.output[0]
-                  sp = y + "_softplus"
-                  th = y + "_tanh"
-                  new_nodes.append(helper.make_node("Softplus", [x],     [sp]))
-                  new_nodes.append(helper.make_node("Tanh",     [sp],    [th]))
-                  new_nodes.append(helper.make_node("Mul",      [x, th], [y]))
+                  x = node.input[0]
+                  y = node.output[0]
+                  new_nodes.append(helper.make_node("Softplus", [x], [y + "_softplus"]))
+                  new_nodes.append(helper.make_node("Tanh", [y + "_softplus"], [y + "_tanh"]))
+                  new_nodes.append(helper.make_node("Mul", [x, y + "_tanh"], [y]))
               else:
                   new_nodes.append(node)
           del model.graph.node[:]
           model.graph.node.extend(new_nodes)
           print(f"Replaced {mish_count} Mish nodes")
 
-          # ── Trích xuất Split node info động ──
-          # Hỗ trợ cả opset 11 (attribute) và opset 13+ (initializer input)
+          # Extract Split node info (opset 11 attribute or opset 13+ initializer)
           split_config = {}
           for node in model.graph.node:
-              if node.op_type != 'Split':
+              if node.op_type != "Split":
                   continue
-
               split_sizes = []
-
-              # opset 13+: split sizes nằm ở input thứ 2 (initializer)
               if len(node.input) > 1:
                   for init in model.graph.initializer:
                       if init.name == node.input[1]:
@@ -78,35 +71,24 @@ jobs:
                           if not split_sizes and list(init.int32_data):
                               split_sizes = list(init.int32_data)
                           break
-
-              # opset 11: split sizes nằm ở attribute 'split'
               if not split_sizes:
                   for attr in node.attribute:
-                      if attr.name == 'split':
+                      if attr.name == "split":
                           split_sizes = list(attr.ints)
                           break
-
               if not split_sizes:
                   print(f"  WARNING: Cannot determine split sizes for '{node.name}'")
                   continue
-
-              # Tính cumulative offsets
               offsets = [0]
               for s in split_sizes:
                   offsets.append(offsets[-1] + int(s))
-
               out_map = {}
               for i, out_name in enumerate(node.output):
                   out_map[out_name] = [offsets[i], offsets[i + 1]]
+              split_config[node.name] = {"outputs": out_map, "split_sizes": [int(s) for s in split_sizes]}
+              print(f"  Split '{node.name}': sizes={[int(s) for s in split_sizes]}, total={offsets[-1]}")
 
-              split_config[node.name] = {
-                  'outputs': out_map,
-                  'split_sizes': [int(s) for s in split_sizes]
-              }
-              print(f"  Split '{node.name}': sizes={[int(s) for s in split_sizes]}, "
-                    f"total_channels={offsets[-1]}")
-
-          with open('split_config.json', 'w') as f:
+          with open("split_config.json", "w") as f:
               json.dump(split_config, f, indent=2)
           print(f"\nExtracted info for {len(split_config)} Split nodes")
 
@@ -122,20 +104,17 @@ jobs:
             || cp merged.onnx model_simplified.onnx
           ls -lh model_simplified.onnx
 
-      - name: Download ncnn tools (20240820) & install deps
+      - name: Download ncnn tools & install deps
         run: |
           wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
           unzip -q ncnn-20240820-ubuntu-2204.zip
           chmod +x ncnn-20240820-ubuntu-2204/bin/*
-
           wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
           sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
 
       - name: Convert ONNX to NCNN
         run: |
-          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
-          $ONNX2NCNN model_simplified.onnx raw.param raw.bin 2>&1
-
+          ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn model_simplified.onnx raw.param raw.bin 2>&1
           if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
             echo "ERROR: onnx2ncnn failed!"
             exit 1
@@ -143,53 +122,46 @@ jobs:
           echo "=== onnx2ncnn OK ==="
           ls -lh raw.param raw.bin
 
-      # ── BƯỚC MỚI: Debug raw.param trước khi fix ──
-      - name: Debug - Inspect raw param structure
+      - name: Debug raw.param
         run: |
           echo "=== Header ==="
           head -3 raw.param
           echo ""
           echo "=== Dynamic Split/Slice layers ==="
-          grep -E "^(Split|Slice)" raw.param || echo "(none found)"
+          grep -E "^(Split|Slice)" raw.param | head -20 || echo "(none)"
           echo ""
           echo "=== Layer type summary ==="
           awk 'NR>2 {print $1}' raw.param | sort | uniq -c | sort -rn
-          echo ""
-          echo "=== DepthToSpace layers ==="
-          grep "DepthToSpace" raw.param || echo "(none)"
 
-      - name: Auto-Fix: Trim val_24 bin data + Crop fix
+      - name: Auto-Fix param + bin (all-in-one)
         run: |
           python3 << 'PYEOF'
           import re, json, os
 
-          # ── Load split config ──
+          # ── Load split config from ONNX ──
           blob_split_map = {}
-          if os.path.exists('split_config.json'):
-              with open('split_config.json') as f:
+          if os.path.exists("split_config.json"):
+              with open("split_config.json") as f:
                   cfg = json.load(f)
               for n, info in cfg.items():
-                  for blob, (s, e) in info['outputs'].items():
+                  for blob, (s, e) in info["outputs"].items():
                       blob_split_map[blob] = (int(s), int(e))
+              print(f"Loaded {len(blob_split_map)} blob->channel_range from ONNX")
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          # ★ Giữ nguyên raw.bin, chỉ cắt 16 bytes đầu (val_24 data)
-          # ★ val_24 = 4 floats × 4 bytes = 16 bytes
-          with open('raw.bin', 'rb') as f:
+          # ── Trim val_24 data (16 bytes) from .bin ──
+          # val_24 = 4 floats x 4 bytes = 16 bytes at the start of raw.bin
+          VAL24_BYTES = 4 * 4
+          with open("raw.bin", "rb") as f:
               bin_data = f.read()
-
-          VAL24_BYTES = 4 * 4  # 16 bytes
           trimmed_bin = bin_data[VAL24_BYTES:]
-
-          with open('2xParagonSR_Nano_gan.bin', 'wb') as f:
+          with open("2xParagonSR_Nano_gan.bin", "wb") as f:
               f.write(trimmed_bin)
-
-          print(f"Bin: trimmed {VAL24_BYTES} bytes "
-                f"({len(bin_data)} → {len(trimmed_bin)} bytes)")
+          print(f"Bin: trimmed {VAL24_BYTES} bytes ({len(bin_data)} -> {len(trimmed_bin)} bytes)")
 
           # ── Fix .param ──
-          with open('raw.param', 'r') as f:
+          with open("raw.param", "r") as f:
               lines = f.readlines()
 
           magic  = lines[0]
@@ -199,7 +171,7 @@ jobs:
 
           new_lines = [magic, lines[1]]
           removed = 0
-          added = 0
+          added   = 0
 
           for line in lines[2:]:
               parts = line.strip().split()
@@ -210,20 +182,20 @@ jobs:
               op_type   = parts[0]
               node_name = parts[1]
 
-              # ★ Xóa MemoryData val_24 (data đã trim khỏi .bin)
-              if op_type == 'MemoryData' and node_name == 'val_24':
+              # Xóa MemoryData val_24 (data đã trim khỏi .bin)
+              if op_type == "MemoryData" and node_name == "val_24":
                   removed += 1
                   print(f"  Removed: MemoryData val_24")
                   continue
 
-              # ★ Xóa Split splitncnn_0 (chuyên val_24 → 6 output, gây SIGFPE)
-              if op_type == 'Split' and node_name == 'splitncnn_0':
+              # Xóa Split splitncnn_0 (chia 4->6, gây SIGFPE)
+              if op_type == "Split" and node_name == "splitncnn_0":
                   removed += 1
                   print(f"  Removed: Split splitncnn_0")
                   continue
 
-              # ★ Dynamic Split → static Crop
-              if op_type in ['Slice', 'Split']:
+              # Dynamic Split/Slice (num_inputs > 1) -> static Crop
+              if op_type in ["Slice", "Split"]:
                   try:
                       num_inputs  = int(parts[2])
                       num_outputs = int(parts[3])
@@ -241,7 +213,7 @@ jobs:
                               start, end = blob_split_map[out_blob]
                           else:
                               idx = -1
-                              m = re.search(r'_(\d+)$', out_blob)
+                              m = re.search(r"_(\d+)$", out_blob)
                               if m:
                                   idx = int(m.group(1))
                               if idx not in FALLBACK:
@@ -263,43 +235,38 @@ jobs:
                               f" 2={start} 6={ncrop}\n"
                           )
                           added += 1
+                          print(f"  Crop {node_name}_{i}: coffset={start} outc={ncrop}")
 
                       removed += 1
-                      print(f"  Replaced '{node_name}' → {num_outputs} Crop")
+                      print(f"  Replaced '{node_name}' -> {num_outputs} Crop")
                       continue
+
+              # DepthToSpace -> PixelShuffle
+              if op_type == "DepthToSpace":
+                  line = line.replace("DepthToSpace", "PixelShuffle")
+                  if " 0=" not in line:
+                      line = line.rstrip() + " 0=2\n"
+                  print(f"  DepthToSpace -> PixelShuffle: {node_name}")
 
               new_lines.append(line)
 
           new_layer_count = layer_count - removed + added
           new_lines[1] = f"{new_layer_count} {blob_count}\n"
 
-          with open('2xParagonSR_Nano_gan.param', 'w') as f:
+          with open("2xParagonSR_Nano_gan.param", "w") as f:
               f.writelines(new_lines)
 
-          print(f"\n✅ Removed {removed}, Added {added}")
+          print(f"\n✅ Removed {removed}, Added {added} Crop nodes")
+          print(f"✅ Layer count: {layer_count} -> {new_layer_count}")
           PYEOF
-
-      - name: DepthToSpace -> PixelShuffle
-        run: |
-          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
-            python3 -c "
-          with open('2xParagonSR_Nano_gan.param') as f: txt = f.read()
-          import re
-          txt = txt.replace('DepthToSpace', 'PixelShuffle')
-          def fix(m):
-              l = m.group(0)
-              return l.rstrip() + ' 0=2' if ' 0=' not in l else l
-          txt = re.sub(r'PixelShuffle\s+\S+.*', fix, txt, flags=re.M)
-          with open('2xParagonSR_Nano_gan.param','w') as f: f.write(txt)
-          "
-            echo "✅ DepthToSpace -> PixelShuffle"
-          fi
 
       - name: Optimize NCNN
         run: |
           NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
+
           echo "=== Pre-optimize ==="
           head -3 2xParagonSR_Nano_gan.param
+          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
 
           if $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
                optimized.param optimized.bin 0; then
@@ -311,19 +278,32 @@ jobs:
             exit 1
           fi
 
-      - name: Validate
+      - name: Validate final
         run: |
+          echo "=== Final Param ==="
           head -3 2xParagonSR_Nano_gan.param
-          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+          echo ""
+
+          MD=$(grep -c "MemoryData" 2xParagonSR_Nano_gan.param 2>/dev/null || echo "0")
+          echo "MemoryData: $MD"
           echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
+          echo "PixelShuffle: $(grep -c 'PixelShuffle' 2xParagonSR_Nano_gan.param || echo 0)"
+
+          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
+          if [ "$BIN_SIZE" -lt 50000 ]; then
+            echo "ERROR: .bin too small!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== CONVERSION SUCCESS ==="
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 2xParagonSR_Nano_gan_ncnn_autofixed
+          name: 2xParagonSR_Nano_gan_ncnn
           path: |
             2xParagonSR_Nano_gan.param
             2xParagonSR_Nano_gan.bin
-            split_config.json
           retention-days: 1
