@@ -1,11 +1,7 @@
-name: Convert RealPLKSR to NCNN
+name: Convert RealPLKSR Dysample LayerNorm to NCNN
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/convert_to_ncnn.yml'
 
 jobs:
   convert:
@@ -14,76 +10,90 @@ jobs:
     env:
       MODEL_NAME: 2xPublic_realplksr_dysample_layernorm_real
       ONNX_URL: https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real_fp32_op17.onnx
+      NCNN_VER: "20240820"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 1. Tải file ONNX có sẵn ──────────────────────────────────────────
-      - name: Download ONNX model
-        run: |
-          mkdir -p models output_ncnn
-          wget -q "$ONNX_URL" -O "models/${MODEL_NAME}.onnx"
-          echo "Downloaded: $(du -sh models/${MODEL_NAME}.onnx)"
-
-      # ── 2. Cài onnxsim để simplify (phòng khi ncnn không hiểu op) ────────
-      - name: Set up Python & onnxsim
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: pip
+          python-version: '3.10'
 
-      - name: Install onnxsim
-        run: pip install onnxsim onnx
+      - name: Install Python deps
+        run: pip install onnx onnxsim numpy
 
+      # ── 1. Tải ONNX có sẵn ───────────────────────────────────────────────
+      - name: Download ONNX model
+        run: |
+          wget -q -O "${MODEL_NAME}.onnx" "$ONNX_URL"
+          ls -lh "${MODEL_NAME}.onnx"
+
+      # ── 2. Simplify ONNX ──────────────────────────────────────────────────
       - name: Simplify ONNX
         run: |
           python -m onnxsim \
-            "models/${MODEL_NAME}.onnx" \
-            "models/${MODEL_NAME}_sim.onnx" \
-            --input-shape "input:1,3,64,64" || \
-          cp "models/${MODEL_NAME}.onnx" "models/${MODEL_NAME}_sim.onnx"
-          echo "Simplified size: $(du -sh models/${MODEL_NAME}_sim.onnx)"
+            "${MODEL_NAME}.onnx" \
+            "${MODEL_NAME}_sim.onnx" \
+            --input-shape "input:1,3,256,256" 2>&1 \
+            || cp "${MODEL_NAME}.onnx" "${MODEL_NAME}_sim.onnx"
+          ls -lh "${MODEL_NAME}_sim.onnx"
 
-      # ── 3. Cài ncnn tools ─────────────────────────────────────────────────
-      - name: Install NCNN tools
+      # ── 3. Cài ncnn tools (version cố định, ổn định) ─────────────────────
+      - name: Download ncnn tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y wget unzip
+          wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/ncnn-${NCNN_VER}-ubuntu-2204.zip"
+          unzip -q "ncnn-${NCNN_VER}-ubuntu-2204.zip"
+          chmod +x "ncnn-${NCNN_VER}-ubuntu-2204/bin/"*
 
-          NCNN_VER=$(curl -s https://api.github.com/repos/Tencent/ncnn/releases/latest \
-                     | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "Using ncnn $NCNN_VER"
+          # libprotobuf23 cần thiết cho onnx2ncnn trên Ubuntu 22.04
+          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
 
-          wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/ncnn-${NCNN_VER}-ubuntu-2204.zip" \
-               -O ncnn.zip
-          unzip -q ncnn.zip
-          echo "$PWD/ncnn-${NCNN_VER}-ubuntu-2204/bin" >> $GITHUB_PATH
-
-      # ── 4. Convert ONNX → NCNN (fp32) ─────────────────────────────────────
-      - name: Convert ONNX → NCNN fp32
+      # ── 4. Convert ONNX → NCNN ────────────────────────────────────────────
+      - name: Convert ONNX to NCNN
         run: |
-          onnx2ncnn \
-            "models/${MODEL_NAME}_sim.onnx" \
-            "output_ncnn/${MODEL_NAME}_fp32.param" \
-            "output_ncnn/${MODEL_NAME}_fp32.bin"
-          echo "fp32 sizes: $(du -sh output_ncnn/*)"
+          ONNX2NCNN="./ncnn-${NCNN_VER}-ubuntu-2204/bin/onnx2ncnn"
+          $ONNX2NCNN "${MODEL_NAME}_sim.onnx" raw.param raw.bin 2>&1
 
-      # ── 5. Tối ưu sang fp16 ───────────────────────────────────────────────
-      - name: Optimize → NCNN fp16
+          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
+            echo "ERROR: onnx2ncnn failed!"
+            exit 1
+          fi
+          echo "=== onnx2ncnn OK ==="
+          ls -lh raw.param raw.bin
+
+      # ── 5. Post-process param (DepthToSpace → PixelShuffle) ───────────────
+      - name: Post-process NCNN param
         run: |
-          ncnnoptimize \
-            "output_ncnn/${MODEL_NAME}_fp32.param" \
-            "output_ncnn/${MODEL_NAME}_fp32.bin" \
-            "output_ncnn/${MODEL_NAME}_fp16.param" \
-            "output_ncnn/${MODEL_NAME}_fp16.bin" \
-            65536
-          echo "fp16 sizes: $(du -sh output_ncnn/*)"
+          cp raw.param "${MODEL_NAME}.param"
+          cp raw.bin   "${MODEL_NAME}.bin"
+
+          if grep -q "DepthToSpace" "${MODEL_NAME}.param"; then
+            echo "Replacing DepthToSpace → PixelShuffle..."
+            sed -i 's/DepthToSpace/PixelShuffle/g' "${MODEL_NAME}.param"
+          fi
+
+          echo "=== Param validation ==="
+          head -3 "${MODEL_NAME}.param"
+
+          BIN_SIZE=$(stat -c%s "${MODEL_NAME}.bin")
+          if [ "$BIN_SIZE" -lt 50000 ]; then
+            echo "ERROR: .bin too small (${BIN_SIZE} bytes) — conversion likely failed!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== CONVERSION SUCCESS ==="
+          ls -lh "${MODEL_NAME}.param" "${MODEL_NAME}.bin"
 
       # ── 6. Upload artifacts ───────────────────────────────────────────────
-      - name: Upload NCNN models
+      - name: Upload NCNN model
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MODEL_NAME }}_ncnn
-          path: output_ncnn/
-          retention-days: 30
+          path: |
+            ${{ env.MODEL_NAME }}.param
+            ${{ env.MODEL_NAME }}.bin
+          retention-days: 90
