@@ -158,14 +158,10 @@ jobs:
           echo "=== DepthToSpace layers ==="
           grep "DepthToSpace" raw.param || echo "(none)"
 
-      - name: Auto-Fix NCNN Param + Fuse MemoryData into .bin
+      - name: Auto-Fix: Trim val_24 bin data + Crop fix
         run: |
           python3 << 'PYEOF'
-          import re, json, os, numpy as np, onnx
-
-          # ── Load ONNX initializers ──
-          onnx_model = onnx.load("merged.onnx")
-          init_map = {init.name: init for init in onnx_model.graph.initializer}
+          import re, json, os
 
           # ── Load split config ──
           blob_split_map = {}
@@ -178,9 +174,21 @@ jobs:
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          # ── Start fresh bin (bỏ data thừa của val_24 ở đầu) ──
-          bin_data = bytearray()
+          # ★ Giữ nguyên raw.bin, chỉ cắt 16 bytes đầu (val_24 data)
+          # ★ val_24 = 4 floats × 4 bytes = 16 bytes
+          with open('raw.bin', 'rb') as f:
+              bin_data = f.read()
 
+          VAL24_BYTES = 4 * 4  # 16 bytes
+          trimmed_bin = bin_data[VAL24_BYTES:]
+
+          with open('2xParagonSR_Nano_gan.bin', 'wb') as f:
+              f.write(trimmed_bin)
+
+          print(f"Bin: trimmed {VAL24_BYTES} bytes "
+                f"({len(bin_data)} → {len(trimmed_bin)} bytes)")
+
+          # ── Fix .param ──
           with open('raw.param', 'r') as f:
               lines = f.readlines()
 
@@ -202,82 +210,19 @@ jobs:
               op_type   = parts[0]
               node_name = parts[1]
 
-              # ── XÓA val_24 (MemoryData mồ côi) ──
+              # ★ Xóa MemoryData val_24 (data đã trim khỏi .bin)
               if op_type == 'MemoryData' and node_name == 'val_24':
                   removed += 1
                   print(f"  Removed: MemoryData val_24")
                   continue
 
-              # ── XÓA splitncnn_0 (Split mồ côi, chia 4→6) ──
+              # ★ Xóa Split splitncnn_0 (chuyên val_24 → 6 output, gây SIGFPE)
               if op_type == 'Split' and node_name == 'splitncnn_0':
                   removed += 1
                   print(f"  Removed: Split splitncnn_0")
                   continue
 
-              # ── FIX MemoryData: ghi data vào bin, thêm 10=offset 11=size ──
-              if op_type == 'MemoryData':
-                  try:
-                      num_out = int(parts[3])
-                      out_blob = parts[4]
-
-                      w = h = d = c = 1
-                      for p in parts[5:]:
-                          if '=' in p:
-                              k, v = p.split('=', 1)
-                              ki = int(k)
-                              if ki == 0: w = int(v)
-                              elif ki == 1: h = int(v)
-                              elif ki == 2: d = int(v)
-                              elif ki == 3: c = int(v)
-
-                      total = w * h * d * c
-
-                      # Tìm initializer name (remove ncnn suffixes)
-                      init_name = out_blob
-                      if init_name not in init_map:
-                          # Thử các biến thể tên
-                          for candidate in [node_name, out_blob]:
-                              if candidate in init_map:
-                                  init_name = candidate
-                                  break
-
-                      if init_name in init_map:
-                          arr = np.array(
-                              onnx.numpy_helper.to_array(init_map[init_name]),
-                              dtype=np.float32
-                          ).flatten()
-
-                          if len(arr) == total:
-                              # Align 4 bytes
-                              while len(bin_data) % 4 != 0:
-                                  bin_data.append(0)
-                              offset = len(bin_data)
-                              bin_data.extend(arr.tobytes())
-                              size = len(arr) * 4
-
-                              new_line = (
-                                  f"MemoryData {node_name} 0 1 {out_blob}"
-                                  f" 0={w} 1={h} 2={d} 3={c}"
-                                  f" 10={offset} 11={size}\n"
-                              )
-                              new_lines.append(new_line)
-                              print(f"  ✅ {node_name}: {total} floats, "
-                                    f"offset={offset}, size={size}")
-                              continue
-                          else:
-                              print(f"  ⚠️ {node_name}: len mismatch "
-                                    f"({len(arr)} vs {total})")
-                      else:
-                          print(f"  ⚠️ {node_name}: init '{init_name}' not found")
-
-                  except Exception as e:
-                      print(f"  ⚠️ {node_name}: {e}")
-
-                  # Nếu fix失败, bỏ qua layer này (không thêm vào new_lines)
-                  removed += 1
-                  continue
-
-              # ── Dynamic Split → static Crop ──
+              # ★ Dynamic Split → static Crop
               if op_type in ['Slice', 'Split']:
                   try:
                       num_inputs  = int(parts[2])
@@ -320,25 +265,18 @@ jobs:
                           added += 1
 
                       removed += 1
-                      print(f"  Replaced '{node_name}' -> {num_outputs} Crop")
+                      print(f"  Replaced '{node_name}' → {num_outputs} Crop")
                       continue
 
               new_lines.append(line)
 
-          # ── Update header ──
           new_layer_count = layer_count - removed + added
           new_lines[1] = f"{new_layer_count} {blob_count}\n"
 
-          # ── Write .param ──
           with open('2xParagonSR_Nano_gan.param', 'w') as f:
               f.writelines(new_lines)
 
-          # ── Write .bin (mới, chỉ chứa MemoryData data) ──
-          with open('2xParagonSR_Nano_gan.bin', 'wb') as f:
-              f.write(bin_data)
-
           print(f"\n✅ Removed {removed}, Added {added}")
-          print(f"✅ New bin: {len(bin_data)} bytes")
           PYEOF
 
       - name: DepthToSpace -> PixelShuffle
@@ -346,15 +284,12 @@ jobs:
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
             python3 -c "
           with open('2xParagonSR_Nano_gan.param') as f: txt = f.read()
-          txt = txt.replace('DepthToSpace', 'PixelShuffle')
-          # Thêm 0=2 nếu chưa có
           import re
-          def add_scale(m):
-              line = m.group(0)
-              if ' 0=' not in line:
-                  return line.rstrip() + ' 0=2'
-              return line
-          txt = re.sub(r'PixelShuffle\s+\S+.*', add_scale, txt, flags=re.MULTILINE)
+          txt = txt.replace('DepthToSpace', 'PixelShuffle')
+          def fix(m):
+              l = m.group(0)
+              return l.rstrip() + ' 0=2' if ' 0=' not in l else l
+          txt = re.sub(r'PixelShuffle\s+\S+.*', fix, txt, flags=re.M)
           with open('2xParagonSR_Nano_gan.param','w') as f: f.write(txt)
           "
             echo "✅ DepthToSpace -> PixelShuffle"
@@ -363,10 +298,8 @@ jobs:
       - name: Optimize NCNN
         run: |
           NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
-
-          echo "=== Pre-optimize check ==="
+          echo "=== Pre-optimize ==="
           head -3 2xParagonSR_Nano_gan.param
-          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
 
           if $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
                optimized.param optimized.bin 0; then
@@ -378,166 +311,11 @@ jobs:
             exit 1
           fi
 
-      - name: Validate final
+      - name: Validate
         run: |
-          echo "=== Final ==="
           head -3 2xParagonSR_Nano_gan.param
           echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
           echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
-          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
-          
-      # ── Sửa DepthToSpace → PixelShuffle với tham số đúng ──
-      - name: DepthToSpace → PixelShuffle (with scale factor)
-        run: |
-          cp raw.bin 2xParagonSR_Nano_gan.bin
-
-          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
-            echo "Converting DepthToSpace → PixelShuffle..."
-
-            # Dùng Python để thay thế chính xác, giữ tham số
-            python3 << 'PYEOF'
-          with open('2xParagonSR_Nano_gan.param', 'r') as f:
-              lines = f.readlines()
-
-          new_lines = []
-          for line in lines:
-              if 'DepthToSpace' in line:
-                  # Thay tên layer
-                  line = line.replace('DepthToSpace', 'PixelShuffle')
-                  # Đảm bảo có tham số 0= (block_size/scale_factor)
-                  # Nếu chưa có, thêm 0=2 cho model 2x
-                  if ' 0=' not in line:
-                      line = line.rstrip() + ' 0=2'
-                      print(f"  Added 0=2 to PixelShuffle")
-                  print(f"  → {line.rstrip()}")
-              new_lines.append(line)
-
-          with open('2xParagonSR_Nano_gan.param', 'w') as f:
-              f.writelines(new_lines)
-          PYEOF
-
-            echo "=== PixelShuffle layers ==="
-            grep "PixelShuffle" 2xParagonSR_Nano_gan.param || echo "(none)"
-          else
-            echo "No DepthToSpace layers found in param"
-          fi
-
-      # ── Chạy ncnnoptimize với fallback nếu crash ──
-      - name: Optimize NCNN (crash-safe with fallback)
-        run: |
-          NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
-
-          echo "Running ncnnoptimize..."
-          if $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
-               optimized.param optimized.bin 0 2>&1; then
-            mv optimized.param 2xParagonSR_Nano_gan.param
-            mv optimized.bin   2xParagonSR_Nano_gan.bin
-            echo "✅ ncnnoptimize completed successfully."
-          else
-            EXIT_CODE=$?
-            echo "⚠️ ncnnoptimize crashed (exit $EXIT_CODE)! Falling back to manual cleanup..."
-
-            python3 << 'PYEOF'
-          """
-          Manual cleanup thay thế ncnnoptimize:
-          - Xóa MemoryData mồ côi (output không được consumed)
-          - Cập nhật layer count trong header
-          """
-          with open('2xParagonSR_Nano_gan.param', 'r') as f:
-              lines = f.readlines()
-
-          magic  = lines[0]
-          counts = lines[1].strip().split()
-          layer_count = int(counts[0])
-          blob_count  = int(counts[1])
-
-          # Thu thập tất cả blob names được dùng làm input
-          consumed_blobs = set()
-          layer_entries  = []
-
-          for line in lines[2:]:
-              parts = line.strip().split()
-              if not parts:
-                  layer_entries.append(line)
-                  continue
-              try:
-                  ni = int(parts[2])
-                  no = int(parts[3])
-              except (IndexError, ValueError):
-                  layer_entries.append(line)
-                  continue
-              inputs = parts[4:4+ni]
-              for b in inputs:
-                  consumed_blobs.add(b)
-              layer_entries.append(line)
-
-          # Xóa MemoryData layers mà output blob không được ai consume
-          new_lines = [magic, lines[1]]
-          removed = 0
-          for line in layer_entries:
-              parts = line.strip().split()
-              if parts and parts[0] == 'MemoryData':
-                  try:
-                      ni = int(parts[2])
-                      no = int(parts[3])
-                      outputs = parts[4+ni:4+ni+no]
-                      if not any(b in consumed_blobs for b in outputs):
-                          removed += 1
-                          print(f"  Removed orphan MemoryData: {parts[1]}")
-                          continue
-                  except (IndexError, ValueError):
-                      pass
-              new_lines.append(line)
-
-          new_layer_count = layer_count - removed
-          new_lines[1] = f"{new_layer_count} {blob_count}\n"
-
-          with open('2xParagonSR_Nano_gan.param', 'w') as f:
-              f.writelines(new_lines)
-
-          print(f"✅ Manual cleanup: removed {removed} orphan MemoryData layers")
-          PYEOF
-          fi
-
-      - name: Final check & Validate
-        run: |
-          echo "=== Final Param Validation ==="
-          head -3 2xParagonSR_Nano_gan.param
-
-          # Kiểm tra input tensor
-          if grep -q "Input.*input" 2xParagonSR_Nano_gan.param; then
-            echo "✅ Input tensor name: 'input'"
-          else
-            echo "⚠️ Input tensor name might not be 'input'!"
-            grep "^Input" 2xParagonSR_Nano_gan.param | head -3
-          fi
-
-          # Kiểm tra MemoryData
-          MDCOUNT=$(grep -c "MemoryData" 2xParagonSR_Nano_gan.param 2>/dev/null || echo "0")
-          if [ "$MDCOUNT" -gt 0 ]; then
-            echo "⚠️ Still has $MDCOUNT MemoryData layers"
-          else
-            echo "✅ Clean from orphan MemoryData"
-          fi
-
-          # Kiểm tra Crop layers
-          CROPCOUNT=$(grep -c "^Crop" 2xParagonSR_Nano_gan.param 2>/dev/null || echo "0")
-          echo "ℹ️ Crop layers: $CROPCOUNT"
-
-          # Kiểm tra PixelShuffle
-          grep -c "PixelShuffle" 2xParagonSR_Nano_gan.param >/dev/null 2>&1 \
-            && echo "✅ Has PixelShuffle layer(s)" \
-            || echo "ℹ️ No PixelShuffle (may use different upsampling)"
-
-          # Kiểm tra bin size
-          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
-          if [ "$BIN_SIZE" -lt 50000 ]; then
-            echo "ERROR: .bin file too small ($BIN_SIZE bytes)!"
-            exit 1
-          fi
-
-          echo ""
-          echo "=== CONVERSION SUCCESS ==="
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
 
       - name: Upload artifacts
