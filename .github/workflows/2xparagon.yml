@@ -1,0 +1,244 @@
+name: Convert 2xParagonSR_Nano_gan (Auto-Fix Param)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python deps
+        run: pip install onnx onnxsim numpy
+
+      - name: Download ONNX model
+        run: |
+          wget -q -O net_g_75000_fused_op18_fp32.onnx \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
+          wget -q -O net_g_75000_fused_op18_fp32.onnx.data \
+            "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
+          ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
+
+      - name: Merge external data & decompose Mish
+        run: |
+          python3 << 'PYEOF'
+          import onnx
+          from onnx import helper
+          import os
+
+          print("Loading ONNX with external data...")
+          model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
+          print("External data merged OK")
+
+          new_nodes = []
+          mish_count = 0
+          for node in model.graph.node:
+              if node.op_type == "Mish":
+                  mish_count += 1
+                  x  = node.input[0]
+                  y  = node.output[0]
+                  sp = y + "_softplus"
+                  th = y + "_tanh"
+                  new_nodes.append(helper.make_node("Softplus", [x],     [sp]))
+                  new_nodes.append(helper.make_node("Tanh",     [sp],    [th]))
+                  new_nodes.append(helper.make_node("Mul",      [x, th], [y]))
+              else:
+                  new_nodes.append(node)
+
+          del model.graph.node[:]
+          model.graph.node.extend(new_nodes)
+          print(f"Replaced {mish_count} Mish nodes")
+
+          onnx.save(model, "merged.onnx", save_as_external_data=False)
+          size_mb = os.path.getsize("merged.onnx") / (1024 * 1024)
+          print(f"Saved merged.onnx ({size_mb:.1f} MB)")
+          PYEOF
+
+      - name: Simplify ONNX
+        run: |
+          python -m onnxsim merged.onnx model_simplified.onnx \
+            --input-shape "input:1,3,512,512" 2>&1 \
+            || cp merged.onnx model_simplified.onnx
+          ls -lh model_simplified.onnx
+
+      - name: Download ncnn tools (20240820) & install deps
+        run: |
+          wget -q "https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip"
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          chmod +x ncnn-20240820-ubuntu-2204/bin/*
+
+          wget -q "http://archive.ubuntu.com/ubuntu/pool/main/p/protobuf/libprotobuf23_3.12.4-1ubuntu7_amd64.deb"
+          sudo dpkg -i libprotobuf23_3.12.4-1ubuntu7_amd64.deb || true
+
+      - name: Convert ONNX to NCNN
+        run: |
+          ONNX2NCNN=./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn
+          $ONNX2NCNN model_simplified.onnx raw.param raw.bin 2>&1
+
+          if [ ! -f "raw.param" ] || [ ! -f "raw.bin" ]; then
+            echo "ERROR: onnx2ncnn failed!"
+            exit 1
+          fi
+          echo "=== onnx2ncnn OK ==="
+          ls -lh raw.param raw.bin
+
+      - name: Auto-Fix NCNN Param (Dynamic Slice -> Static Slice)
+        run: |
+          python3 << 'PYEOF'
+          import re
+
+          # Cấu hình Slice tĩnh cho model 2xParagonSR_Nano_gan (24 channels chia làm 15, 3, 3, 3)
+          SPLIT_MAP = {
+              0: (0, 15),
+              1: (15, 18),
+              2: (18, 21),
+              3: (21, 24)
+          }
+
+          def is_dynamic_node(param_tokens):
+              """Kiểm tra node có chứa sentinel -233 (dynamic) trong params hay không."""
+              for tok in param_tokens:
+                  if tok.startswith("-23300=") and "-233" in tok:
+                      return True
+              return False
+
+          def fix_ncnn_param(input_file, output_file):
+              with open(input_file, 'r') as f:
+                  lines = f.readlines()
+
+              magic   = lines[0]
+              counts  = lines[1].strip().split()
+              layer_count = int(counts[0])
+              blob_count  = int(counts[1])
+
+              new_lines = [magic, lines[1]]
+              removed = 0
+              added   = 0
+
+              for line in lines[2:]:
+                  parts = line.strip().split()
+                  if not parts:
+                      new_lines.append(line)
+                      continue
+
+                  op_type = parts[0]
+
+                  # Xử lý cả Slice và Split dynamic (onnx2ncnn có thể sinh ra 1 trong 2 loại)
+                  if op_type not in ['Slice', 'Split']:
+                      new_lines.append(line)
+                      continue
+
+                  try:
+                      node_name  = parts[1]
+                      num_inputs  = int(parts[2])
+                      num_outputs = int(parts[3])
+                  except (IndexError, ValueError):
+                      new_lines.append(line)
+                      continue
+
+                  input_blobs  = parts[4 : 4 + num_inputs]
+                  output_blobs = parts[4 + num_inputs : 4 + num_inputs + num_outputs]
+                  param_tokens = parts[4 + num_inputs + num_outputs :]
+
+                  # Bỏ qua nếu là node Split/Slice tĩnh hợp lệ
+                  if not is_dynamic_node(param_tokens):
+                      new_lines.append(line)
+                      continue
+
+                  # ---- Bắt đầu thay thế ----
+                  data_blob = input_blobs[0]
+
+                  for i, out_blob in enumerate(output_blobs):
+                      # Tìm số thứ tự ở đuôi blob (VD: split_0, split_1) để map đúng kích thước channel
+                      idx = -1
+                      match = re.search(r'_(\d+)$', out_blob)
+                      if match:
+                          idx = int(match.group(1))
+                      
+                      # Nếu không tìm thấy đuôi số, dùng thứ tự lặp i làm fallback
+                      if idx not in SPLIT_MAP:
+                          idx = i
+
+                      if idx in SPLIT_MAP:
+                          start, end = SPLIT_MAP[idx]
+                      else:
+                          print(f"  WARNING: Không tìm thấy map cho index {idx} của blob {out_blob}")
+                          start, end = 0, 0 # Fallback an toàn
+
+                      static_line = (
+                          f"Slice"
+                          f"            {node_name}_{i}"
+                          f" 1 1"
+                          f" {data_blob}"
+                          f" {out_blob}"
+                          f" -23300=1,{start}"
+                          f" -23301=1,{end}"
+                          f" -23302=1,0\n"
+                      )
+                      new_lines.append(static_line)
+                      added += 1
+
+                  removed += 1
+                  print(f"  Replaced dynamic '{op_type}' node '{node_name}' -> {num_outputs} static Slice nodes")
+
+              # Cập nhật layer count
+              new_layer_count = layer_count - removed + added
+              new_lines[1] = f"{new_layer_count} {blob_count}\n"
+
+              with open(output_file, 'w') as f:
+                  f.writelines(new_lines)
+
+              print(f"\n✅ Done: removed {removed} dynamic nodes, added {added} static Slice nodes.")
+              print(f"   Layer count: {layer_count} -> {new_layer_count}")
+
+          fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
+          PYEOF
+          
+      - name: Post-process & final check
+        run: |
+          cp raw.bin 2xParagonSR_Nano_gan.bin
+
+          # DepthToSpace → PixelShuffle
+          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
+            echo "Replacing DepthToSpace → PixelShuffle..."
+            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
+          fi
+
+          echo "=== Final Param Validation ==="
+          head -3 2xParagonSR_Nano_gan.param
+          
+          # Đảm bảo không còn Slice/Split động
+          if grep -E "(Slice|Split).*\-23300=.*\-233" 2xParagonSR_Nano_gan.param; then
+            echo "⚠️ WARNING: File still contains dynamic Slice/Split!"
+          else
+            echo "✅ Model is completely clean from dynamic Slice/Split!"
+          fi
+
+          echo "Static Slice layers: $(grep -c 'Slice.*\-23300=1' 2xParagonSR_Nano_gan.param || echo 0)"
+
+          BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
+          if [ "$BIN_SIZE" -lt 50000 ]; then
+            echo "ERROR: .bin too small!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== CONVERSION SUCCESS ==="
+          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 2xParagonSR_Nano_gan_ncnn_autofixed
+          path: |
+            2xParagonSR_Nano_gan.param
+            2xParagonSR_Nano_gan.bin
+          retention-days: 1
