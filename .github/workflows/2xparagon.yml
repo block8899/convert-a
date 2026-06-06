@@ -90,24 +90,17 @@ jobs:
           echo "=== onnx2ncnn OK ==="
           ls -lh raw.param raw.bin
 
-      - name: Auto-Fix NCNN Param (Dynamic Slice -> Static Slice & Clean Orphan MemoryData)
+      - name: Auto-Fix NCNN Param (Dynamic Slice/Split -> Static Slice)
         run: |
           python3 << 'PYEOF'
           import re
 
-          # Cấu hình Slice tĩnh cho model 2xParagonSR_Nano_gan
           SPLIT_MAP = {
               0: (0, 15),
               1: (15, 18),
               2: (18, 21),
               3: (21, 24)
           }
-
-          def is_dynamic_node(param_tokens):
-              for tok in param_tokens:
-                  if tok.startswith("-23300=") and "-233" in tok:
-                      return True
-              return False
 
           def fix_ncnn_param(input_file, output_file):
               with open(input_file, 'r') as f:
@@ -121,7 +114,6 @@ jobs:
               new_lines = [magic, lines[1]]
               removed = 0
               added   = 0
-              orphan_blobs = set()
 
               for line in lines[2:]:
                   parts = line.strip().split()
@@ -131,129 +123,90 @@ jobs:
 
                   op_type = parts[0]
 
-                  if op_type not in ['Slice', 'Split']:
-                      new_lines.append(line)
-                      continue
-
-                  try:
-                      node_name  = parts[1]
-                      num_inputs  = int(parts[2])
-                      num_outputs = int(parts[3])
-                  except (IndexError, ValueError):
-                      new_lines.append(line)
-                      continue
-
-                  input_blobs  = parts[4 : 4 + num_inputs]
-                  output_blobs = parts[4 + num_inputs : 4 + num_inputs + num_outputs]
-                  param_tokens = parts[4 + num_inputs + num_outputs :]
-
-                  if not is_dynamic_node(param_tokens):
-                      new_lines.append(line)
-                      continue
-
-                  data_blob = input_blobs[0]
-                  # Các blob input sau blob đầu tiên là starts, ends, axes... 
-                  # Chúng sinh ra từ MemoryData, khi bỏ Slice động thì chúng trở thành mồ côi (orphan)
-                  for ob in input_blobs[1:]:
-                      orphan_blobs.add(ob)
-
-                  for i, out_blob in enumerate(output_blobs):
-                      idx = -1
-                      match = re.search(r'_(\d+)$', out_blob)
-                      if match:
-                          idx = int(match.group(1))
-                      
-                      if idx not in SPLIT_MAP:
-                          idx = i
-
-                      if idx in SPLIT_MAP:
-                          start, end = SPLIT_MAP[idx]
-                      else:
-                          print(f"  WARNING: Không tìm thấy map cho index {idx} của blob {out_blob}")
-                          start, end = 0, 0
-
-                      # SỬA LỖI CÚ PHÁP NCNN: Key=Value. Định dạng mảng phải là Key=-23300,Size,Val
-                      static_line = (
-                          f"Slice"
-                          f"            {node_name}_{i}"
-                          f" 1 1"
-                          f" {data_blob}"
-                          f" {out_blob}"
-                          f" 0=-23300,1,{start}"
-                          f" 1=-23300,1,{end}"
-                          f" 2=-23300,1,0\n"
-                      )
-                      new_lines.append(static_line)
-                      added += 1
-
-                  removed += 1
-                  print(f"  Replaced dynamic '{op_type}' node '{node_name}' -> {num_outputs} static Slice nodes")
-
-              # Dọn dẹp các node MemoryData bị mồ côi (orphan)
-              final_lines = []
-              mem_data_removed = 0
-              for line in new_lines:
-                  parts = line.strip().split()
-                  if not parts or len(parts) < 4:
-                      final_lines.append(line)
-                      continue
-                  
-                  op_type = parts[0]
-                  if op_type == "MemoryData":
+                  # Xử lý cả Slice và Split động. Dấu hiệu nhận biết: num_inputs > 1 
+                  # (Slice tĩnh chỉ có 1 input là data, Split tĩnh cũng chỉ có 1 input là data)
+                  if op_type in ['Slice', 'Split']:
                       try:
-                          num_out = int(parts[3])
-                          out_blobs = parts[4 : 4 + num_out]
-                          if all(ob in orphan_blobs for ob in out_blobs):
-                              mem_data_removed += 1
-                              continue # Bỏ qua node MemoryData mồ côi này
+                          node_name  = parts[1]
+                          num_inputs  = int(parts[2])
+                          num_outputs = int(parts[3])
                       except (IndexError, ValueError):
-                          pass
-                  
-                  final_lines.append(line)
+                          new_lines.append(line)
+                          continue
 
-              # Tính toán lại số lượng layer và blob chính xác
-              new_layer_count = layer_count - removed + added - mem_data_removed
-              
-              blob_set = set()
-              for line in final_lines[2:]:
-                  parts = line.strip().split()
-                  if len(parts) < 4: continue
-                  try:
-                      n_in = int(parts[2])
-                      n_out = int(parts[3])
-                      for b in parts[4 : 4 + n_in + n_out]:
-                          blob_set.add(b)
-                  except ValueError:
-                      pass
-              
-              new_blob_count = len(blob_set)
-              final_lines[1] = f"{new_layer_count} {new_blob_count}\n"
+                      if num_inputs > 1:
+                          input_blobs  = parts[4 : 4 + num_inputs]
+                          output_blobs = parts[4 + num_inputs : 4 + num_inputs + num_outputs]
+
+                          data_blob = input_blobs[0] # Data luôn là input đầu tiên
+
+                          for i, out_blob in enumerate(output_blobs):
+                              idx = -1
+                              match = re.search(r'_(\d+)$', out_blob)
+                              if match:
+                                  idx = int(match.group(1))
+                              
+                              if idx not in SPLIT_MAP:
+                                  idx = i
+
+                              if idx in SPLIT_MAP:
+                                  start, end = SPLIT_MAP[idx]
+                              else:
+                                  print(f"  WARNING: Không tìm thấy map cho index {idx} của blob {out_blob}")
+                                  start, end = 0, 0
+
+                              # SỬA LỖI CÚ PHÁP NCNN: Key=-23300 Size Val (bắt buộc cách nhau bằng space)
+                              static_line = (
+                                  f"Slice"
+                                  f"            {node_name}_{i}"
+                                  f" 1 1"
+                                  f" {data_blob}"
+                                  f" {out_blob}"
+                                  f" 0=-23300 1 {start}"
+                                  f" 1=-23300 1 {end}"
+                                  f" 2=-23300 1 0\n"
+                              )
+                              new_lines.append(static_line)
+                              added += 1
+
+                          removed += 1
+                          print(f"  Replaced dynamic '{op_type}' node '{node_name}' -> {num_outputs} static Slice nodes")
+                          continue
+                      
+                  # Giữ nguyên các node tĩnh hoặc node khác
+                  new_lines.append(line)
+
+              # Cập nhật layer count
+              new_layer_count = layer_count - removed + added
+              new_lines[1] = f"{new_layer_count} {blob_count}\n"
 
               with open(output_file, 'w') as f:
-                  f.writelines(final_lines)
+                  f.writelines(new_lines)
 
-              print(f"\n✅ Done: removed {removed} dynamic nodes, added {added} static Slice nodes, removed {mem_data_removed} orphan MemoryData.")
+              print(f"\n✅ Done: removed {removed} dynamic nodes, added {added} static Slice nodes.")
               print(f"   Layer count: {layer_count} -> {new_layer_count}")
-              print(f"   Blob count: {blob_count} -> {new_blob_count}")
 
           fix_ncnn_param('raw.param', '2xParagonSR_Nano_gan.param')
           PYEOF
           
-      - name: Optimize NCNN (Fuse Graph & Constants)
+      - name: Optimize NCNN (Fuse Orphan MemoryData & Constants)
         run: |
           NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
           
-          # DepthToSpace → PixelShuffle trước khi chạy optimize
+          # 1. Copy file .bin gốc (Bắt buộc phải có trước khi optimize)
+          cp raw.bin 2xParagonSR_Nano_gan.bin
+
+          # 2. DepthToSpace → PixelShuffle
           if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
             echo "Replacing DepthToSpace → PixelShuffle..."
             sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
           fi
 
+          # 3. Chạy ncnnoptimize để dọn dẹp 13 MemoryData, val_24 và gộp vào .bin
           echo "Running ncnnoptimize to fuse graph and remaining constants..."
-          # Chạy ncnnoptimize với cờ 0 (giữ nguyên fp32)
           $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin optimized.param optimized.bin 0
           
-          # Ghi đè bằng file đã tối ưu
+          # 4. Ghi đè file cũ bằng file đã tối ưu
           mv optimized.param 2xParagonSR_Nano_gan.param
           mv optimized.bin 2xParagonSR_Nano_gan.bin
           
@@ -272,13 +225,13 @@ jobs:
           fi
           
           # Đảm bảo không còn Slice/Split động
-          if grep -E "(Slice|Split).*\-23300=.*\-233" 2xParagonSR_Nano_gan.param; then
+          if grep -E "^Split|^Slice" 2xParagonSR_Nano_gan.param | grep -q "\-233"; then
             echo "⚠️ WARNING: File still contains dynamic Slice/Split!"
           else
             echo "✅ Model is completely clean from dynamic Slice/Split!"
           fi
 
-          # Đảm bảo không còn MemoryData rác
+          # Đảm bảo không còn MemoryData rác (ncnnoptimize đã gộp vào bin)
           if grep -q "MemoryData" 2xParagonSR_Nano_gan.param; then
             echo "⚠️ WARNING: File still contains MemoryData layers!"
           else
