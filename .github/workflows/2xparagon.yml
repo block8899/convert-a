@@ -79,7 +79,7 @@ jobs:
           print(f"   Model type: {type(pytorch_model).__name__}")
 
           # Sanity check
-          dummy = torch.randn(1, 3, 128, 128)
+          dummy = torch.randn(1, 3, 64, 64)
           with torch.no_grad():
               out = pytorch_model(dummy)
           print(f"   Sanity: {list(dummy.shape)} -> {list(out.shape)}")
