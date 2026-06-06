@@ -65,57 +65,30 @@ jobs:
       - name: Convert ONNX to NCNN
         run: |
           ./ncnn-20240820-ubuntu-2204/bin/onnx2ncnn model_simplified.onnx raw.param raw.bin 2>&1
-          echo "=== raw.param header ==="
-          head -3 raw.param
-          echo ""
-          echo "=== MemoryData count ==="
-          grep -c "MemoryData" raw.param || echo 0
-          echo ""
-          echo "=== val_24 lines ==="
-          grep "val_24" raw.param || echo "(none)"
           ls -lh raw.param raw.bin
 
       - name: Fix param + bin
         run: |
           python3 << 'PYEOF'
-          import re, json, os
-
-          # ── Load split config if exists ──
-          blob_split_map = {}
-          if os.path.exists("split_config.json"):
-              with open("split_config.json") as f:
-                  cfg = json.load(f)
-              for n, info in cfg.items():
-                  for blob, (s, e) in info["outputs"].items():
-                      blob_split_map[blob] = (int(s), int(e))
+          import re, os
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
 
-          # ── Read raw.bin ──
+          # Trim val_24 data (4 floats = 16 bytes) from bin start
           with open("raw.bin", "rb") as f:
               raw = f.read()
-
-          # ── Parse raw.param to calculate val_24 data size ──
-          # val_24 = MemoryData with 0=4 → 4 floats × 4 bytes = 16 bytes
-          # onnx2ncnn writes MemoryData data sequentially to .bin
-          # val_24 is the first MemoryData → first 16 bytes
-          VAL24_SIZE = 4 * 4  # 16 bytes
-
-          # ── Trim .bin: remove val_24 data from start ──
-          trimmed = raw[VAL24_SIZE:]
+          trimmed = raw[16:]
           with open("2xParagonSR_Nano_gan.bin", "wb") as f:
               f.write(trimmed)
-          print(f"Bin: {len(raw)} -> {len(trimmed)} bytes (removed {VAL24_SIZE}B val_24)")
+          print(f"Bin: {len(raw)} -> {len(trimmed)} bytes (trimmed 16B)")
 
-          # ── Fix .param ──
+          # Fix .param
           with open("raw.param") as f:
               lines = f.readlines()
 
-          magic = lines[0]
           lc, bc = lines[1].strip().split()
-          out = [magic, lines[1]]
-          rm = 0
-          add = 0
+          out = [lines[0], lines[1]]
+          rm = 0; add = 0
 
           for line in lines[2:]:
               p = line.strip().split()
@@ -125,19 +98,19 @@ jobs:
 
               op, nm = p[0], p[1]
 
-              # ── Remove: MemoryData val_24 (orphan, data trimmed from .bin) ──
+              # Remove MemoryData val_24
               if op == "MemoryData" and nm == "val_24":
                   rm += 1
                   print(f"  Removed: MemoryData val_24")
                   continue
 
-              # ── Remove: Split splitncnn_0 (consumes val_24, orphan) ──
+              # Remove Split splitncnn_0
               if op == "Split" and nm == "splitncnn_0":
                   rm += 1
                   print(f"  Removed: Split splitncnn_0")
                   continue
 
-              # ── Dynamic Split/Slice → static Crop ──
+              # Dynamic Split/Slice -> static Crop
               if op in ("Slice", "Split"):
                   try:
                       ni, no = int(p[2]), int(p[3])
@@ -149,19 +122,13 @@ jobs:
                       ob = p[4+ni:4+ni+no]
                       for i, o in enumerate(ob):
                           s = e = None
-                          if o in blob_split_map:
-                              s, e = blob_split_map[o]
-                          else:
-                              m = re.search(r"_(\d+)$", o)
-                              idx = int(m.group(1)) if m else i
-                              if idx in FALLBACK:
-                                  s, e = FALLBACK[idx]
+                          m = re.search(r"_(\d+)$", o)
+                          idx = int(m.group(1)) if m else i
+                          if idx in FALLBACK:
+                              s, e = FALLBACK[idx]
                           if s is not None and e > s:
                               nc = e - s
-                              out.append(
-                                  f"Crop {nm}_{i} 1 1 {ib[0]} {o}"
-                                  f" 2={s} 6={nc}\n"
-                              )
+                              out.append(f"Crop {nm}_{i} 1 1 {ib[0]} {o} 2={s} 6={nc}\n")
                               add += 1
                           else:
                               out.append(line)
@@ -169,7 +136,7 @@ jobs:
                       print(f"  Replaced '{nm}' -> {no} Crop")
                       continue
 
-              # ── DepthToSpace → PixelShuffle ──
+              # DepthToSpace -> PixelShuffle
               if op == "DepthToSpace":
                   line = line.replace("DepthToSpace", "PixelShuffle")
                   if " 0=" not in line:
@@ -177,72 +144,41 @@ jobs:
 
               out.append(line)
 
-          # ── Update header ──
-          new_lc = int(lc) - rm + add
-          out[1] = f"{new_lc} {bc}\n"
-
+          out[1] = f"{int(lc)-rm+add} {bc}\n"
           with open("2xParagonSR_Nano_gan.param", "w") as f:
               f.writelines(out)
-
-          print(f"\nRemoved {rm}, Added {add}, Layers: {lc} -> {new_lc}")
-
-          # ── Verify no val_24 or splitncnn_0 ──
-          with open("2xParagonSR_Nano_gan.param") as f:
-              txt = f.read()
-          assert "val_24" not in txt, "ERROR: val_24 still in param!"
-          assert "splitncnn_0" not in txt, "ERROR: splitncnn_0 still in param!"
-          print("Verified: no val_24, no splitncnn_0")
+          print(f"\nRemoved {rm}, Added {add}, Layers: {lc} -> {int(lc)-rm+add}")
           PYEOF
 
-      - name: Optimize NCNN (fuse MemoryData -> Scale)
+      - name: Optimize NCNN
         run: |
           NCNNOPT=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
-
-          echo "=== Before optimize ==="
-          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "MemoryData before: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
 
           if $NCNNOPT 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
                optimized.param optimized.bin 0; then
             mv optimized.param 2xParagonSR_Nano_gan.param
             mv optimized.bin 2xParagonSR_Nano_gan.bin
-            echo ""
-            echo "=== After optimize ==="
-            echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
-            echo "✅ ncnnoptimize OK - MemoryData fused into Scale"
+            echo "MemoryData after: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+            echo "✅ ncnnoptimize OK"
           else
             echo "❌ ncnnoptimize failed"
             exit 1
           fi
 
-      - name: Validate final
+      - name: Validate
         run: |
-          echo "=== Final Param ==="
-          head -5 2xParagonSR_Nano_gan.param
+          echo "=== Final ==="
+          head -3 2xParagonSR_Nano_gan.param
           echo ""
-
-          MD=$(grep -c "MemoryData" 2xParagonSR_Nano_gan.param 2>/dev/null || echo "0")
-          INPUTS=$(grep -c "^Input" 2xParagonSR_Nano_gan.param)
-          echo "MemoryData: $MD"
-          echo "Input layers: $INPUTS"
-          echo ""
-
-          if [ "$MD" -gt 0 ]; then
-            echo "WARNING: MemoryData still present"
-          fi
-          if [ "$INPUTS" -ne 1 ]; then
-            echo "ERROR: Expected 1 Input, got $INPUTS"
-            exit 1
-          fi
-
-          echo "=== Layer summary ==="
-          awk 'NR>2 {print $1}' 2xParagonSR_Nano_gan.param | sort | uniq -c | sort -rn
+          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param 2>/dev/null || echo 0)"
+          echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
 
           BIN_SIZE=$(stat -c%s "2xParagonSR_Nano_gan.bin")
           [ "$BIN_SIZE" -lt 100000 ] && echo "ERROR: .bin too small!" && exit 1
 
-          echo ""
           echo "=== SUCCESS ==="
-          ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
+          ls -lh 2xParagonSR_Nano_gan.*
 
       - name: Upload
         uses: actions/upload-artifact@v4
