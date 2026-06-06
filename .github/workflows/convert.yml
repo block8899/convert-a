@@ -55,7 +55,7 @@ jobs:
 
       - name: 🔄 PNNX → NCNN
         run: |
-          pnnx model.pt inputshape=[1,3,64,64]
+          pnnx model.pt inputshape=[1,3,1024,1024]
           
           if [ -f "model.ncnn.param" ]; then
             mv model.ncnn.param 2xPublic_realplksr_dysample_layernorm_real.ncnn.param
