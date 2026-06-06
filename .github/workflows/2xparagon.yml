@@ -23,11 +23,11 @@ jobs:
 
       - name: Download ONNX model
         run: |
-          wget -q -O model_external.onnx \
+          wget -q -O net_g_75000_fused_op18_fp32.onnx \
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx"
-          wget -q -O model_external.onnx.data \
+          wget -q -O net_g_75000_fused_op18_fp32.onnx.data \
             "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_op18_fp32.onnx.data"
-          ls -lh model_external.onnx model_external.onnx.data
+          ls -lh net_g_75000_fused_op18_fp32.onnx net_g_75000_fused_op18_fp32.onnx.data
 
       - name: Merge ONNX external data + Convert
         run: |
@@ -35,9 +35,9 @@ jobs:
           import onnx, os, torch
           from onnx2torch import convert
 
-          # Step 1: Merge external data
+          # Step 1: Merge external data into single ONNX
           print("Merging external data...")
-          model = onnx.load("model_external.onnx")
+          model = onnx.load("net_g_75000_fused_op18_fp32.onnx")
           onnx.save(model, "model_merged.onnx", save_as_external_data=False)
           size_mb = os.path.getsize("model_merged.onnx") / (1024*1024)
           print(f"Merged ONNX: {size_mb:.1f} MB")
