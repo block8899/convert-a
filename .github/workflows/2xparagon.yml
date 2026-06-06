@@ -158,20 +158,28 @@ jobs:
           echo "=== DepthToSpace layers ==="
           grep "DepthToSpace" raw.param || echo "(none)"
 
-      - name: Auto-Fix NCNN Param (Only Crop fix)
+      - name: Auto-Fix NCNN Param + Fuse MemoryData into .bin
         run: |
           python3 << 'PYEOF'
-          import re, json, os
+          import re, json, os, numpy as np, onnx
 
+          # ── Load ONNX initializers ──
+          onnx_model = onnx.load("merged.onnx")
+          init_map = {init.name: init for init in onnx_model.graph.initializer}
+
+          # ── Load split config ──
           blob_split_map = {}
           if os.path.exists('split_config.json'):
               with open('split_config.json') as f:
                   cfg = json.load(f)
-              for node_name, info in cfg.items():
+              for n, info in cfg.items():
                   for blob, (s, e) in info['outputs'].items():
                       blob_split_map[blob] = (int(s), int(e))
 
           FALLBACK = {0: (0, 15), 1: (15, 18), 2: (18, 21), 3: (21, 24)}
+
+          # ── Start fresh bin (bỏ data thừa của val_24 ở đầu) ──
+          bin_data = bytearray()
 
           with open('raw.param', 'r') as f:
               lines = f.readlines()
@@ -183,10 +191,7 @@ jobs:
 
           new_lines = [magic, lines[1]]
           removed = 0
-          added   = 0
-
-          # ★ KHÔNG xóa val_24, KHÔNG xóa splitncnn_0, KHÔNG xóa MemoryData
-          # ★ Chỉ thay dynamic Split/Slice (num_inputs > 1) → static Crop
+          added = 0
 
           for line in lines[2:]:
               parts = line.strip().split()
@@ -194,11 +199,87 @@ jobs:
                   new_lines.append(line)
                   continue
 
-              op_type = parts[0]
+              op_type   = parts[0]
+              node_name = parts[1]
 
+              # ── XÓA val_24 (MemoryData mồ côi) ──
+              if op_type == 'MemoryData' and node_name == 'val_24':
+                  removed += 1
+                  print(f"  Removed: MemoryData val_24")
+                  continue
+
+              # ── XÓA splitncnn_0 (Split mồ côi, chia 4→6) ──
+              if op_type == 'Split' and node_name == 'splitncnn_0':
+                  removed += 1
+                  print(f"  Removed: Split splitncnn_0")
+                  continue
+
+              # ── FIX MemoryData: ghi data vào bin, thêm 10=offset 11=size ──
+              if op_type == 'MemoryData':
+                  try:
+                      num_out = int(parts[3])
+                      out_blob = parts[4]
+
+                      w = h = d = c = 1
+                      for p in parts[5:]:
+                          if '=' in p:
+                              k, v = p.split('=', 1)
+                              ki = int(k)
+                              if ki == 0: w = int(v)
+                              elif ki == 1: h = int(v)
+                              elif ki == 2: d = int(v)
+                              elif ki == 3: c = int(v)
+
+                      total = w * h * d * c
+
+                      # Tìm initializer name (remove ncnn suffixes)
+                      init_name = out_blob
+                      if init_name not in init_map:
+                          # Thử các biến thể tên
+                          for candidate in [node_name, out_blob]:
+                              if candidate in init_map:
+                                  init_name = candidate
+                                  break
+
+                      if init_name in init_map:
+                          arr = np.array(
+                              onnx.numpy_helper.to_array(init_map[init_name]),
+                              dtype=np.float32
+                          ).flatten()
+
+                          if len(arr) == total:
+                              # Align 4 bytes
+                              while len(bin_data) % 4 != 0:
+                                  bin_data.append(0)
+                              offset = len(bin_data)
+                              bin_data.extend(arr.tobytes())
+                              size = len(arr) * 4
+
+                              new_line = (
+                                  f"MemoryData {node_name} 0 1 {out_blob}"
+                                  f" 0={w} 1={h} 2={d} 3={c}"
+                                  f" 10={offset} 11={size}\n"
+                              )
+                              new_lines.append(new_line)
+                              print(f"  ✅ {node_name}: {total} floats, "
+                                    f"offset={offset}, size={size}")
+                              continue
+                          else:
+                              print(f"  ⚠️ {node_name}: len mismatch "
+                                    f"({len(arr)} vs {total})")
+                      else:
+                          print(f"  ⚠️ {node_name}: init '{init_name}' not found")
+
+                  except Exception as e:
+                      print(f"  ⚠️ {node_name}: {e}")
+
+                  # Nếu fix失败, bỏ qua layer này (không thêm vào new_lines)
+                  removed += 1
+                  continue
+
+              # ── Dynamic Split → static Crop ──
               if op_type in ['Slice', 'Split']:
                   try:
-                      node_name   = parts[1]
                       num_inputs  = int(parts[2])
                       num_outputs = int(parts[3])
                   except (IndexError, ValueError):
@@ -215,9 +296,9 @@ jobs:
                               start, end = blob_split_map[out_blob]
                           else:
                               idx = -1
-                              match = re.search(r'_(\d+)$', out_blob)
-                              if match:
-                                  idx = int(match.group(1))
+                              m = re.search(r'_(\d+)$', out_blob)
+                              if m:
+                                  idx = int(m.group(1))
                               if idx not in FALLBACK:
                                   idx = i
                               if idx in FALLBACK:
@@ -231,16 +312,11 @@ jobs:
                               new_lines.append(line)
                               continue
 
-                          static_line = (
-                              f"Crop"
-                              f"            {node_name}_{i}"
-                              f" 1 1"
-                              f" {data_blob}"
-                              f" {out_blob}"
-                              f" 2={start}"
-                              f" 6={ncrop}\n"
+                          new_lines.append(
+                              f"Crop            {node_name}_{i}"
+                              f" 1 1 {data_blob} {out_blob}"
+                              f" 2={start} 6={ncrop}\n"
                           )
-                          new_lines.append(static_line)
                           added += 1
 
                       removed += 1
@@ -249,26 +325,49 @@ jobs:
 
               new_lines.append(line)
 
+          # ── Update header ──
           new_layer_count = layer_count - removed + added
           new_lines[1] = f"{new_layer_count} {blob_count}\n"
 
+          # ── Write .param ──
           with open('2xParagonSR_Nano_gan.param', 'w') as f:
               f.writelines(new_lines)
 
-          print(f"✅ Replaced {removed} dynamic nodes, added {added} Crop")
+          # ── Write .bin (mới, chỉ chứa MemoryData data) ──
+          with open('2xParagonSR_Nano_gan.bin', 'wb') as f:
+              f.write(bin_data)
+
+          print(f"\n✅ Removed {removed}, Added {added}")
+          print(f"✅ New bin: {len(bin_data)} bytes")
           PYEOF
+
+      - name: DepthToSpace -> PixelShuffle
+        run: |
+          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
+            python3 -c "
+          with open('2xParagonSR_Nano_gan.param') as f: txt = f.read()
+          txt = txt.replace('DepthToSpace', 'PixelShuffle')
+          # Thêm 0=2 nếu chưa có
+          import re
+          def add_scale(m):
+              line = m.group(0)
+              if ' 0=' not in line:
+                  return line.rstrip() + ' 0=2'
+              return line
+          txt = re.sub(r'PixelShuffle\s+\S+.*', add_scale, txt, flags=re.MULTILINE)
+          with open('2xParagonSR_Nano_gan.param','w') as f: f.write(txt)
+          "
+            echo "✅ DepthToSpace -> PixelShuffle"
+          fi
 
       - name: Optimize NCNN
         run: |
-          cp raw.bin 2xParagonSR_Nano_gan.bin
           NCNNOPTIMIZE=./ncnn-20240820-ubuntu-2204/bin/ncnnoptimize
 
-          # PixelShuffle
-          if grep -q "DepthToSpace" 2xParagonSR_Nano_gan.param; then
-            sed -i 's/DepthToSpace/PixelShuffle/g' 2xParagonSR_Nano_gan.param
-          fi
+          echo "=== Pre-optimize check ==="
+          head -3 2xParagonSR_Nano_gan.param
+          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
 
-          echo "Running ncnnoptimize..."
           if $NCNNOPTIMIZE 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin \
                optimized.param optimized.bin 0; then
             mv optimized.param 2xParagonSR_Nano_gan.param
@@ -279,19 +378,14 @@ jobs:
             exit 1
           fi
 
-      - name: Validate
+      - name: Validate final
         run: |
-          echo "=== Header ==="
+          echo "=== Final ==="
           head -3 2xParagonSR_Nano_gan.param
-
-          echo "=== MemoryData count ==="
-          grep -c "MemoryData" 2xParagonSR_Nano_gan.param || echo "0"
-
-          echo "=== Input count ==="
-          grep -c "^Input" 2xParagonSR_Nano_gan.param || echo "0"
-
+          echo "MemoryData: $(grep -c MemoryData 2xParagonSR_Nano_gan.param || echo 0)"
+          echo "Input: $(grep -c '^Input' 2xParagonSR_Nano_gan.param)"
           ls -lh 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin
-
+          
       # ── Sửa DepthToSpace → PixelShuffle với tham số đúng ──
       - name: DepthToSpace → PixelShuffle (with scale factor)
         run: |
