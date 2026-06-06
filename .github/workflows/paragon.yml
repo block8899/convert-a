@@ -220,8 +220,8 @@ jobs:
         run: |
           NCNNOPT=./ncnn-20250503-ubuntu-2204/bin/ncnnoptimize
 
-          # flag 65536 = bật tối ưu constant folding mạnh
-          $NCNNOPT fixed.param fixed.bin 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 65536 2>&1
+          # flag 0 = bật tối ưu constant folding mạnh
+          $NCNNOPT fixed.param fixed.bin 2xParagonSR_Nano_gan.param 2xParagonSR_Nano_gan.bin 0 2>&1
           RESULT=$?
 
           if [ $RESULT -ne 0 ]; then
