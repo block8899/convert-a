@@ -1,4 +1,4 @@
-name: Convert Real-PLKSR 384
+name: Convert Real-PLKSR 256
 
 on:
   workflow_dispatch:
@@ -34,12 +34,12 @@ jobs:
           arch = ModelLoader().load_from_file("model.pth")
           model = arch.model.eval()
           
-          # Giữ nguyên 512x512
+          # Giữ nguyên 256x256
           dummy = torch.randn(1, 3, 256, 256)
 
           with torch.no_grad():
               torch.jit.trace(model, dummy).save("model.pt")
-          print("✅ TorchScript exported with 512x512 shape")
+          print("✅ TorchScript exported with 256x256 shape")
 
       - name: 🔄 PNNX → NCNN
         run: |
@@ -58,7 +58,7 @@ jobs:
       - name: 📤 Upload
         uses: actions/upload-artifact@v4
         with:
-          name: realplksr-512-converted
+          name: realplksr-256-converted
           path: |
             *.ncnn.param
             *.ncnn.bin
