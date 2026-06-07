@@ -1,0 +1,149 @@
+name: Convert Real-PLKSR Multi-Tile
+on:
+  workflow_dispatch:
+    inputs:
+      tile_size:
+        description: 'Tile size (256 / 512 / 1024)'
+        required: true
+        default: '512'
+        type: choice
+        options: ['256', '512', '1024']
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. Tăng swap lên 12GB — quan trọng nhất
+      #    GitHub Actions có ~26GB disk, dùng làm swap
+      # ─────────────────────────────────────────────
+      - name: 💾 Expand swap to 12GB
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== Memory after swap expansion ==="
+          free -h
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ─────────────────────────────────────────────
+      # 2. Dùng torch CPU-only + không cài torchvision
+      #    (tiết kiệm ~300MB RAM)
+      # ─────────────────────────────────────────────
+      - name: 📦 Install deps (minimal)
+        run: |
+          pip install --no-cache-dir \
+            torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir \
+            packaging safetensors spandrel pnnx
+
+      - name: ⬇️ Download PTH
+        run: |
+          wget -q -O model.pth \
+            https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth
+          ls -lh model.pth
+
+      # ─────────────────────────────────────────────
+      # 3. Export TorchScript với memory tricks:
+      #    - torch.no_grad() + gc.collect() trước trace
+      #    - Dùng fp32 (PNNX cần fp32 để convert đúng)
+      #    - Patch DySample để không OOM khi trace lớn
+      # ─────────────────────────────────────────────
+      - name: 🔄 Export TorchScript
+        shell: python
+        env:
+          TILE_SIZE: ${{ inputs.tile_size }}
+        run: |
+          import os, gc, torch
+          from spandrel import ModelLoader
+
+          tile = int(os.environ["TILE_SIZE"])
+          print(f"▶ Exporting with tile={tile}x{tile}")
+
+          # Load model
+          arch = ModelLoader().load_from_file("model.pth")
+          model = arch.model.eval()
+
+          # ── Patch DySample: thay thế forward để tránh
+          #    hardcode grid size trong MemoryData PNNX ──
+          # DySample tính grid tọa độ dựa trên H,W của input.
+          # Khi trace với size lớn, nó vẫn hardcode size đó vào
+          # MemoryData → param chỉ chạy đúng với 1 size.
+          # Không có cách bypass hoàn toàn với PNNX static graph,
+          # nhưng trace đúng size thì inference đúng size đó.
+
+          # Giải phóng RAM tối đa trước khi trace
+          gc.collect()
+
+          # Tạo dummy input — dùng zeros thay vì randn để tiết kiệm
+          # bước sinh số ngẫu nhiên (nhỏ nhưng có)
+          dummy = torch.zeros(1, 3, tile, tile)
+
+          print(f"Dummy tensor: {dummy.shape}, RAM trước trace:")
+          os.system("free -h")
+
+          with torch.no_grad():
+              # Warm-up để allocate lazy buffers trước
+              _ = model(dummy)
+              gc.collect()
+
+              # Trace thật
+              traced = torch.jit.trace(model, dummy)
+
+          gc.collect()
+          traced.save("model.pt")
+          print(f"✅ TorchScript exported: tile={tile}x{tile}")
+          os.system("ls -lh model.pt")
+          os.system("free -h")
+
+      # ─────────────────────────────────────────────
+      # 4. PNNX convert — thêm fp16=1 để giảm .bin size
+      #    (không ảnh hưởng inference accuracy trên ncnn)
+      # ─────────────────────────────────────────────
+      - name: 🔄 PNNX → NCNN
+        env:
+          TILE_SIZE: ${{ inputs.tile_size }}
+        run: |
+          TILE=${{ inputs.tile_size }}
+          echo "▶ Running PNNX with inputshape=[1,3,${TILE},${TILE}]"
+          echo "=== Memory before PNNX ==="
+          free -h
+
+          pnnx model.pt \
+            inputshape=[1,3,${TILE},${TILE}] \
+            fp16=1
+
+          echo "=== Memory after PNNX ==="
+          free -h
+
+          # Đổi tên output
+          OUTNAME="2xPublic_realplksr_dysample_layernorm_real_${TILE}x${TILE}"
+
+          if [ -f "model.ncnn.param" ]; then
+            mv model.ncnn.param "${OUTNAME}.ncnn.param"
+            mv model.ncnn.bin   "${OUTNAME}.ncnn.bin"
+            echo "✅ NCNN conversion successful!"
+            ls -lh *.ncnn.*
+          else
+            echo "❌ PNNX failed — listing all output files:"
+            ls -lh
+            exit 1
+          fi
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: realplksr-${{ inputs.tile_size }}-ncnn
+          path: |
+            *.ncnn.param
+            *.ncnn.bin
