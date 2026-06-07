@@ -1,4 +1,4 @@
-name: Fix MemoryData - Force Static Shape ONNX to NCNN
+name: Fix ONNX MemoryData - Force Static Shape
 
 on:
   workflow_dispatch:
@@ -18,48 +18,45 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          # Đã thêm 'packaging' vào đây
-          pip install torch torchvision onnx onnxsim spandrel packaging
+          pip install onnx onnxsim onnx-graphsurgeon packaging
 
-      - name: Download Model
+      - name: Download Author's ONNX
         run: |
-          wget -O model.safetensors "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_fused.safetensors"
+          # Thay link này bằng link ONNX chính xác của tác giả nhé
+          wget -O model_original.onnx "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan.onnx"
 
-      - name: Export STATIC SHAPE ONNX
-        run: |
-          python - <<EOF
-          import torch
-          from spandrel import ModelLoader
-
-          print("Đang load model...")
-          model = ModelLoader().load_from_file("model.safetensors")
-          model.eval()
-
-          print("Đang xuất ONNX với Static Shape (CỐ ĐỊNH input)...")
-          # Ép cứng dummy_input là 1x3x64x64 để triệt tiêu MemoryData
-          dummy_input = torch.randn(1, 3, 64, 64)
-
-          torch.onnx.export(
-              model, 
-              dummy_input, 
-              "model.onnx", 
-              opset_version=14,
-              input_names=["input"], 
-              output_names=["output"],
-          )
-          print("Đã xuất file ONNX thành công!")
-          EOF
-
-      - name: Simplify ONNX
+      - name: Force Static Input Shape & Simplify
         run: |
           python - <<EOF
           import onnx
+          import onnx_graphsurgeon as og
           from onnxsim import simplify
-          model = onnx.load("model.onnx")
+
+          print("Đang load file ONNX gốc...")
+          graph = og.import_onnx("model_original.onnx")
+
+          # ÉP CỨNG KÍCH THƯỚC ĐẦU VÀO (Quan trọng nhất để triệt tiêu MemoryData)
+          # Giả sử input tên là "input" và shape là [1, 3, -1, -1]
+          # Ta ép nó thành [1, 3, 64, 64]
+          for inp in graph.inputs:
+              print(f"Node input tên là: {inp.name}, shape cũ: {inp.shape}")
+              # Ép shape cứng (Batch=1, Channel=3, Height=64, Width=64)
+              inp.shape = [1, 3, 64, 64] 
+              
+          graph.cleanup().toposort()
+          onnx.save(og.export_onnx(graph), "model_static.onnx")
+          print("Đã ép static shape thành công!")
+
+          print("Đang chạy onnxsim để dọn dẹp các node thừa...")
+          model = onnx.load("model_static.onnx")
+          # Chạy simplify để xóa sạch các node tạo MemoryData
           model_simplified, check = simplify(model)
+          
           if check:
+              print("Simplify thành công!")
               onnx.save(model_simplified, "model_sim.onnx")
           else:
+              print("Simplify lỗi, dùng file static shape.")
               onnx.save(model, "model_sim.onnx")
           EOF
 
@@ -74,16 +71,16 @@ jobs:
           sudo cp onnx2ncnn /usr/local/bin/
           sudo cp ncnnoptimize /usr/local/bin/
 
-      - name: Convert to NCNN & Optimize
+      - name: Convert to NCNN & Optimize (FP16)
         run: |
           onnx2ncnn model_sim.onnx model.param model.bin
-          # Chuyển sang FP16 để app chạy nhẹ hơn
+          # Tối ưu và chuyển sang FP16
           ncnnoptimize model.param model.bin model_opt.param model_opt.bin 65536
 
       - name: Upload Clean NCNN Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ncnn-static-shape-model
+          name: ncnn-clean-model-final
           path: |
             model_opt.param
             model_opt.bin
