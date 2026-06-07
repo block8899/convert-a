@@ -1,0 +1,86 @@
+name: Fix MemoryData - Force Static Shape ONNX to NCNN
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          pip install torch torchvision onnx onnxsim spandrel
+
+      - name: Download Safetensors & Export STATIC SHAPE ONNX
+        run: |
+          python - <<EOF
+          import torch
+          from spandrel import ModelLoader
+
+          print("Đang load model...")
+          model = ModelLoader().load_from_file("model.safetensors")
+          model.eval()
+
+          print("Đang xuất ONNX với Static Shape (CỐ ĐỊNH input)...")
+          # QUAN TRỌNG: Ép cứng dummy_input là 1x3x64x64. Không để kích thước động.
+          dummy_input = torch.randn(1, 3, 64, 64)
+
+          torch.onnx.export(
+              model, 
+              dummy_input, 
+              "model.onnx", 
+              opset_version=14,
+              input_names=["input"], 
+              output_names=["output"],
+              # KHÔNG có tham số dynamic_axes ở đây!
+          )
+          print("Đã xuất file ONNX thành công!")
+          EOF
+
+      - name: Simplify ONNX
+        run: |
+          python - <<EOF
+          import onnx
+          from onnxsim import simplify
+          model = onnx.load("model.onnx")
+          model_simplified, check = simplify(model)
+          if check:
+              onnx.save(model_simplified, "model_sim.onnx")
+          else:
+              onnx.save(model, "model_sim.onnx")
+          EOF
+
+      - name: Install onnx2ncnn & ncnnoptimize
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake
+          git clone https://github.com/Tencent/ncnn.git
+          cd ncnn
+          mkdir build && cd build
+          cmake .. -DONNX2NCNN=ON
+          make -j$(nproc) onnx2ncnn ncnnoptimize
+          sudo cp onnx2ncnn /usr/local/bin/
+          sudo cp ncnnoptimize /usr/local/bin/
+
+      - name: Convert to NCNN & Optimize
+        run: |
+          onnx2ncnn model_sim.onnx model.param model.bin
+          # Chuyển sang FP16 để app chạy nhẹ hơn
+          ncnnoptimize model.param model.bin model_opt.param model_opt.bin 65536
+
+      - name: Upload Clean NCNN Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncnn-static-shape-model
+          path: |
+            model_opt.param
+            model_opt.bin
+          retention-days: 7
