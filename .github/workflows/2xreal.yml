@@ -49,15 +49,149 @@ jobs:
             https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth
           ls -lh model.pth
 
-      - name: 🔄 Export TorchScript (patched DySample)
+      # ─────────────────────────────────────────────────────────────
+      # KEY FIX: Patch dysample.py trực tiếp trên disk TRƯỚC khi import
+      #
+      # Monkey-patching class method sau khi import KHÔNG hoạt động
+      # với JIT trace vì TorchScript compile bytecode của hàm gốc.
+      # Phải sửa file .py để JIT thấy code mới khi trace.
+      #
+      # Thay torch.arange(H)/arange(W) + meshgrid (→ MemoryData H×W)
+      # bằng F.affine_grid (→ AffineGrid op nhỏ gọn, PNNX hiểu được)
+      # ─────────────────────────────────────────────────────────────
+      - name: 🩹 Patch dysample.py on disk
+        shell: python
+        run: |
+          import site, os
+
+          # Tìm file dysample.py trong site-packages
+          dysample_path = None
+          for sp in site.getsitepackages():
+              p = os.path.join(sp, "spandrel", "architectures",
+                               "__arch_helpers", "dysample.py")
+              if os.path.exists(p):
+                  dysample_path = p
+                  break
+
+          assert dysample_path, "dysample.py not found!"
+          print(f"Patching: {dysample_path}")
+
+          # File mới: thay toàn bộ forward() để dùng affine_grid
+          # Giữ nguyên __init__ và _init_pos (không thay đổi weights)
+          new_content = '''import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DySample(nn.Module):
+    """Adapted from 'Learning to Upsample by Learning to Sample':
+    https://arxiv.org/abs/2308.15085
+    https://github.com/tiny-smart/dysample
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_ch: int,
+        scale: int = 2,
+        groups: int = 4,
+        end_convolution: bool = True,
+    ):
+        super().__init__()
+
+        try:
+            assert in_channels >= groups and in_channels % groups == 0
+        except:  # noqa: E722
+            msg = "Incorrect in_channels and groups values."
+            raise ValueError(msg)  # noqa: B904
+
+        out_channels = 2 * groups * scale**2
+        self.scale = scale
+        self.groups = groups
+        self.end_convolution = end_convolution
+        if end_convolution:
+            self.end_conv = nn.Conv2d(in_channels, out_ch, kernel_size=1)
+
+        self.offset = nn.Conv2d(in_channels, out_channels, 1)
+        self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        if self.training:
+            nn.init.trunc_normal_(self.offset.weight, std=0.02)
+            nn.init.constant_(self.scope.weight, val=0)
+
+        self.register_buffer("init_pos", self._init_pos())
+
+    def _init_pos(self):
+        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
+        return (
+            torch.stack(torch.meshgrid([h, h], indexing="ij"))
+            .transpose(1, 2)
+            .repeat(1, self.groups, 1)
+            .reshape(1, -1, 1, 1)
+        )
+
+    def forward(self, x):
+        offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        B, _, H, W = offset.shape
+        offset = offset.view(B, 2, -1, H, W)
+
+        # PATCHED: dung affine_grid thay cho arange/meshgrid
+        # arange(H) va arange(W) bi PNNX serialize thanh MemoryData lon
+        # affine_grid duoc PNNX bien dich thanh 1 AffineGrid op nho
+        identity = torch.zeros(B, 2, 3, dtype=x.dtype, device=x.device)
+        identity[:, 0, 0] = 1.0
+        identity[:, 1, 1] = 1.0
+        # affine_grid tra ve coords [-1,1] shape [B, H, W, 2] (x, y)
+        grid = F.affine_grid(identity, (B, 1, H, W), align_corners=False)
+        # Chuyen sang pixel coords: pixel = (grid+1)/2 * [W,H] - 0.5
+        # shape [B, H, W, 2] -> [B, 2, 1, H, W] de hop voi offset
+        coords = ((grid + 1.0) * 0.5 *
+                  torch.tensor([W, H], dtype=x.dtype, device=x.device)
+                  - 0.5
+                 ).permute(0, 3, 1, 2).unsqueeze(2)
+
+        normalizer = torch.tensor(
+            [W, H], dtype=x.dtype, device=x.device
+        ).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+
+        coords = (
+            F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
+            .view(B, 2, -1, self.scale * H, self.scale * W)
+            .permute(0, 2, 3, 4, 1)
+            .contiguous()
+            .flatten(0, 1)
+        )
+        output = F.grid_sample(
+            x.reshape(B * self.groups, -1, H, W),
+            coords,
+            mode="bilinear",
+            align_corners=False,
+            padding_mode="border",
+        ).view(B, -1, self.scale * H, self.scale * W)
+
+        if self.end_convolution:
+            output = self.end_conv(output)
+
+        return output
+'''
+          with open(dysample_path, "w") as f:
+              f.write(new_content)
+
+          print("Patch written OK")
+          # Verify patch applied
+          with open(dysample_path) as f:
+              content = f.read()
+          assert "affine_grid" in content, "Patch failed!"
+          assert "arange(H)" not in content, "Old code still present!"
+          print("Patch verified: affine_grid present, arange(H) removed")
+
+      - name: 🔄 Export TorchScript
         shell: python
         env:
           TILE_SIZE: ${{ inputs.tile_size }}
         run: |
-          import os, gc, torch, torch.nn as nn, torch.nn.functional as F
-          import subprocess
+          import os, gc, torch, subprocess
           from spandrel import ModelLoader
-          from spandrel.architectures.__arch_helpers.dysample import DySample
 
           def ram(label=""):
               print(f"=== RAM {label} ===")
@@ -66,66 +200,6 @@ jobs:
           tile = int(os.environ["TILE_SIZE"])
           print(f"Tile: {tile}x{tile}")
 
-          # ── Patch DySample.forward ────────────────────────────────
-          # Vấn đề: forward() dùng torch.arange(H) + torch.arange(W)
-          # → PNNX tạo MemoryData node với H=512 và W=512 phần tử
-          # → meshgrid → MemoryData 512x512 = 262144 phần tử → crash
-          #
-          # Fix: Thay coords logic bằng F.affine_grid (1 op duy nhất,
-          # PNNX serialize gọn thành AffineGrid node)
-          # ─────────────────────────────────────────────────────────
-
-          def dysample_forward_patched(self, x):
-              offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
-              B, _, H, W = offset.shape
-              offset = offset.view(B, 2, -1, H, W)
-
-              # Thay toàn bộ coords/meshgrid bằng affine_grid identity
-              # affine_grid tạo normalized grid [-1,1] mà không cần arange/meshgrid
-              theta = torch.eye(2, 3, dtype=x.dtype, device=x.device).unsqueeze(0).expand(B, -1, -1)
-              base_coords = F.affine_grid(theta, (B, 1, H, W), align_corners=False)
-              # base_coords: [B, H, W, 2] (x,y) normalized
-
-              # Convert về pixel space để cộng offset (giống logic gốc)
-              # gốc: coords = (arange + 0.5) -> normalize về [-1,1] bằng /[W,H]*2-1
-              # affine_grid đã cho grid trong [-1,1], convert sang pixel [0,W]/[0,H]:
-              # pixel = (grid + 1) / 2 * [W, H] - 0.5  (align_corners=False convention)
-              coords_pixel = (base_coords + 1) / 2 * torch.tensor(
-                  [W, H], dtype=x.dtype, device=x.device
-              ) - 0.5  # [B, H, W, 2]
-
-              # Reshape để cộng offset: cần [B, 2, 1, H, W]
-              coords_pixel = coords_pixel.permute(0, 3, 1, 2).unsqueeze(2)  # [B, 2, 1, H, W]
-
-              # Cộng offset và normalize về [-1, 1]
-              normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
-              coords = 2 * (coords_pixel + offset) / normalizer - 1  # [B, 2, groups, H, W]
-
-              coords = (
-                  F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
-                  .view(B, 2, -1, self.scale * H, self.scale * W)
-                  .permute(0, 2, 3, 4, 1)
-                  .contiguous()
-                  .flatten(0, 1)
-              )
-              output = F.grid_sample(
-                  x.reshape(B * self.groups, -1, H, W),
-                  coords,
-                  mode="bilinear",
-                  align_corners=False,
-                  padding_mode="border",
-              ).view(B, -1, self.scale * H, self.scale * W)
-
-              if self.end_convolution:
-                  output = self.end_conv(output)
-
-              return output
-
-          # Monkey-patch method vào class (ảnh hưởng tất cả instances)
-          DySample.forward = dysample_forward_patched
-          print("DySample.forward patched OK")
-
-          # ── Load + trace ──────────────────────────────────────────
           ram("before load")
           arch = ModelLoader().load_from_file("model.pth")
           model = arch.model.eval()
@@ -133,10 +207,12 @@ jobs:
 
           dummy = torch.zeros(1, 3, tile, tile)
 
-          print("Warm-up...")
+          print("Warm-up (verify patch works)...")
           with torch.no_grad():
               out = model(dummy)
           print(f"Output shape: {out.shape}")
+          assert out.shape == (1, 3, tile * 2, tile * 2), f"Wrong output shape: {out.shape}"
+          print("Shape check PASSED")
           del out; gc.collect()
           ram("after warm-up")
 
@@ -158,8 +234,8 @@ jobs:
 
           SHAPE="[1,3,${TILE},${TILE}]"
           timeout 600 pnnx model.pt "inputshape=${SHAPE}" fp16=1 \
-            && echo "✅ PNNX OK" \
-            || { echo "❌ PNNX FAILED"; free -h; ls -lh; exit 1; }
+            && echo "PNNX OK" \
+            || { echo "PNNX FAILED"; free -h; ls -lh; exit 1; }
 
           echo "=== RAM after PNNX ===" && free -h
           ls -lh
