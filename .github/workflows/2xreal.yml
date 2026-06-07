@@ -1,4 +1,4 @@
-name: Debug PLKSR Convert
+name: Convert PLKSR
 on:
   workflow_dispatch:
     inputs:
@@ -17,13 +17,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📊 Baseline system info
-        run: |
-          echo "=== CPU ===" && nproc
-          echo "=== RAM ===" && free -h
-          echo "=== DISK ===" && df -h
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: 💾 Expand swap to 16GB
+      - name: System info
+        run: |
+          nproc && free -h && df -h
+
+      - name: Expand swap to 16GB
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 16G /swapfile
@@ -32,215 +33,39 @@ jobs:
           sudo swapon /swapfile
           free -h
 
-      - name: 🐍 Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install deps
+      - name: Install deps
         run: |
           pip install --no-cache-dir torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
           pip install --no-cache-dir packaging safetensors spandrel pnnx
           free -h
 
-      - name: ⬇️ Download PTH
+      - name: Download PTH
         run: |
-          wget -q -O model.pth \
-            https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth
+          wget -q -O model.pth https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth
           ls -lh model.pth
 
-      # ─────────────────────────────────────────────────────────────
-      # KEY FIX: Patch dysample.py trực tiếp trên disk TRƯỚC khi import
-      #
-      # Monkey-patching class method sau khi import KHÔNG hoạt động
-      # với JIT trace vì TorchScript compile bytecode của hàm gốc.
-      # Phải sửa file .py để JIT thấy code mới khi trace.
-      #
-      # Thay torch.arange(H)/arange(W) + meshgrid (→ MemoryData H×W)
-      # bằng F.affine_grid (→ AffineGrid op nhỏ gọn, PNNX hiểu được)
-      # ─────────────────────────────────────────────────────────────
-      - name: 🩹 Patch dysample.py on disk
-        shell: python
-        run: |
-          import site, os
+      - name: Patch dysample.py on disk
+        run: python scripts/patch_dysample.py
 
-          # Tìm file dysample.py trong site-packages
-          dysample_path = None
-          for sp in site.getsitepackages():
-              p = os.path.join(sp, "spandrel", "architectures",
-                               "__arch_helpers", "dysample.py")
-              if os.path.exists(p):
-                  dysample_path = p
-                  break
-
-          assert dysample_path, "dysample.py not found!"
-          print(f"Patching: {dysample_path}")
-
-          # File mới: thay toàn bộ forward() để dùng affine_grid
-          # Giữ nguyên __init__ và _init_pos (không thay đổi weights)
-          new_content = '''import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class DySample(nn.Module):
-    """Adapted from 'Learning to Upsample by Learning to Sample':
-    https://arxiv.org/abs/2308.15085
-    https://github.com/tiny-smart/dysample
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_ch: int,
-        scale: int = 2,
-        groups: int = 4,
-        end_convolution: bool = True,
-    ):
-        super().__init__()
-
-        try:
-            assert in_channels >= groups and in_channels % groups == 0
-        except:  # noqa: E722
-            msg = "Incorrect in_channels and groups values."
-            raise ValueError(msg)  # noqa: B904
-
-        out_channels = 2 * groups * scale**2
-        self.scale = scale
-        self.groups = groups
-        self.end_convolution = end_convolution
-        if end_convolution:
-            self.end_conv = nn.Conv2d(in_channels, out_ch, kernel_size=1)
-
-        self.offset = nn.Conv2d(in_channels, out_channels, 1)
-        self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        if self.training:
-            nn.init.trunc_normal_(self.offset.weight, std=0.02)
-            nn.init.constant_(self.scope.weight, val=0)
-
-        self.register_buffer("init_pos", self._init_pos())
-
-    def _init_pos(self):
-        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
-        return (
-            torch.stack(torch.meshgrid([h, h], indexing="ij"))
-            .transpose(1, 2)
-            .repeat(1, self.groups, 1)
-            .reshape(1, -1, 1, 1)
-        )
-
-    def forward(self, x):
-        offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
-        B, _, H, W = offset.shape
-        offset = offset.view(B, 2, -1, H, W)
-
-        # PATCHED: dung affine_grid thay cho arange/meshgrid
-        # arange(H) va arange(W) bi PNNX serialize thanh MemoryData lon
-        # affine_grid duoc PNNX bien dich thanh 1 AffineGrid op nho
-        identity = torch.zeros(B, 2, 3, dtype=x.dtype, device=x.device)
-        identity[:, 0, 0] = 1.0
-        identity[:, 1, 1] = 1.0
-        # affine_grid tra ve coords [-1,1] shape [B, H, W, 2] (x, y)
-        grid = F.affine_grid(identity, (B, 1, H, W), align_corners=False)
-        # Chuyen sang pixel coords: pixel = (grid+1)/2 * [W,H] - 0.5
-        # shape [B, H, W, 2] -> [B, 2, 1, H, W] de hop voi offset
-        coords = ((grid + 1.0) * 0.5 *
-                  torch.tensor([W, H], dtype=x.dtype, device=x.device)
-                  - 0.5
-                 ).permute(0, 3, 1, 2).unsqueeze(2)
-
-        normalizer = torch.tensor(
-            [W, H], dtype=x.dtype, device=x.device
-        ).view(1, 2, 1, 1, 1)
-        coords = 2 * (coords + offset) / normalizer - 1
-
-        coords = (
-            F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
-            .view(B, 2, -1, self.scale * H, self.scale * W)
-            .permute(0, 2, 3, 4, 1)
-            .contiguous()
-            .flatten(0, 1)
-        )
-        output = F.grid_sample(
-            x.reshape(B * self.groups, -1, H, W),
-            coords,
-            mode="bilinear",
-            align_corners=False,
-            padding_mode="border",
-        ).view(B, -1, self.scale * H, self.scale * W)
-
-        if self.end_convolution:
-            output = self.end_conv(output)
-
-        return output
-'''
-          with open(dysample_path, "w") as f:
-              f.write(new_content)
-
-          print("Patch written OK")
-          # Verify patch applied
-          with open(dysample_path) as f:
-              content = f.read()
-          assert "affine_grid" in content, "Patch failed!"
-          assert "arange(H)" not in content, "Old code still present!"
-          print("Patch verified: affine_grid present, arange(H) removed")
-
-      - name: 🔄 Export TorchScript
-        shell: python
+      - name: Export TorchScript
         env:
           TILE_SIZE: ${{ inputs.tile_size }}
-        run: |
-          import os, gc, torch, subprocess
-          from spandrel import ModelLoader
+        run: python scripts/export_torchscript.py
 
-          def ram(label=""):
-              print(f"=== RAM {label} ===")
-              subprocess.run(["free", "-h"])
-
-          tile = int(os.environ["TILE_SIZE"])
-          print(f"Tile: {tile}x{tile}")
-
-          ram("before load")
-          arch = ModelLoader().load_from_file("model.pth")
-          model = arch.model.eval()
-          ram("after load")
-
-          dummy = torch.zeros(1, 3, tile, tile)
-
-          print("Warm-up (verify patch works)...")
-          with torch.no_grad():
-              out = model(dummy)
-          print(f"Output shape: {out.shape}")
-          assert out.shape == (1, 3, tile * 2, tile * 2), f"Wrong output shape: {out.shape}"
-          print("Shape check PASSED")
-          del out; gc.collect()
-          ram("after warm-up")
-
-          print("JIT trace...")
-          with torch.no_grad():
-              traced = torch.jit.trace(model, dummy)
-          del model; gc.collect()
-          ram("after trace")
-
-          traced.save("model.pt")
-          del traced; gc.collect()
-          print(f"model.pt: {os.path.getsize('model.pt')/1e6:.1f} MB")
-          ram("after save")
-
-      - name: 🔍 PNNX convert
+      - name: PNNX convert
         run: |
           TILE="${{ inputs.tile_size }}"
-          echo "=== RAM before PNNX ===" && free -h
-
+          free -h
           SHAPE="[1,3,${TILE},${TILE}]"
-          timeout 600 pnnx model.pt "inputshape=${SHAPE}" fp16=1 \
-            && echo "PNNX OK" \
-            || { echo "PNNX FAILED"; free -h; ls -lh; exit 1; }
+          timeout 600 pnnx model.pt "inputshape=${SHAPE}" fp16=1 && echo "PNNX OK" || { free -h; ls -lh; exit 1; }
+          free -h && ls -lh
 
-          echo "=== RAM after PNNX ===" && free -h
-          ls -lh
-
-      - name: 📦 Rename outputs
+      - name: Rename outputs
         run: |
           TILE="${{ inputs.tile_size }}"
           BASE="2xPublic_realplksr_dysample_layernorm_real_${TILE}x${TILE}"
@@ -248,7 +73,7 @@ class DySample(nn.Module):
           mv model.ncnn.bin   "${BASE}.ncnn.bin"
           ls -lh *.ncnn.*
 
-      - name: 📤 Upload artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: "realplksr-${{ inputs.tile_size }}-ncnn"
