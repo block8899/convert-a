@@ -9,7 +9,12 @@ for sp in site.getsitepackages():
         break
 
 assert dysample_path, "dysample.py not found!"
-print(f"Patching: {dysample_path}")
+print(f"Found: {dysample_path}")
+
+# Read original to confirm what we're replacing
+with open(dysample_path) as f:
+    original = f.read()
+print("Original forward contains arange:", "coords_h = torch.arange" in original)
 
 new_content = (
     "import torch\n"
@@ -40,7 +45,7 @@ new_content = (
     '        self.register_buffer("init_pos", self._init_pos())\n'
     "\n"
     "    def _init_pos(self):\n"
-    '        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale\n'
+    "        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale\n"
     "        return (\n"
     '            torch.stack(torch.meshgrid([h, h], indexing="ij"))\n'
     "            .transpose(1, 2)\n"
@@ -52,8 +57,9 @@ new_content = (
     "        offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos\n"
     "        B, _, H, W = offset.shape\n"
     "        offset = offset.view(B, 2, -1, H, W)\n"
-    "        # PATCHED: use affine_grid instead of arange/meshgrid\n"
-    "        # arange(H)/arange(W) causes PNNX to create huge MemoryData nodes\n"
+    "        # PATCHED: affine_grid replaces arange/meshgrid coords\n"
+    "        # Original used torch.arange(H) + torch.arange(W) which PNNX\n"
+    "        # serializes as huge MemoryData nodes, crashing pass_level0.\n"
     "        identity = torch.zeros(B, 2, 3, dtype=x.dtype, device=x.device)\n"
     "        identity[:, 0, 0] = 1.0\n"
     "        identity[:, 1, 1] = 1.0\n"
@@ -87,8 +93,17 @@ new_content = (
 with open(dysample_path, "w") as f:
     f.write(new_content)
 
+# Verify
 with open(dysample_path) as f:
     content = f.read()
-assert "affine_grid" in content, "Patch failed: affine_grid not found"
-assert "arange(H)" not in content, "Patch failed: old arange(H) still present"
-print("Patch verified OK")
+
+print("After patch:")
+print("  affine_grid present :", "affine_grid" in content)
+print("  coords_h arange gone:", "coords_h = torch.arange" not in content)
+print("  coords_w arange gone:", "coords_w = torch.arange" not in content)
+
+assert "affine_grid" in content, "FAIL: affine_grid not written"
+assert "coords_h = torch.arange" not in content, "FAIL: coords_h arange still present"
+assert "coords_w = torch.arange" not in content, "FAIL: coords_w arange still present"
+
+print("Patch OK")
