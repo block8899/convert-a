@@ -17,9 +17,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ─────────────────────────────────────────────
-      # STEP 0: Xem baseline RAM/disk của runner
-      # ─────────────────────────────────────────────
       - name: 📊 Baseline system info
         run: |
           echo "=== CPU ==="
@@ -28,12 +25,9 @@ jobs:
           free -h
           echo "=== DISK ==="
           df -h
-          echo "=== Swap hiện tại ==="
+          echo "=== Swap ==="
           swapon --show || echo "(none)"
 
-      # ─────────────────────────────────────────────
-      # STEP 1: Tăng swap
-      # ─────────────────────────────────────────────
       - name: 💾 Expand swap to 16GB
         run: |
           sudo swapoff -a || true
@@ -41,81 +35,64 @@ jobs:
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          echo "=== RAM + Swap sau khi expand ==="
+          echo "=== RAM + Swap ==="
           free -h
 
-      # ─────────────────────────────────────────────
-      # STEP 2: Python + deps — in RAM sau mỗi bước
-      # ─────────────────────────────────────────────
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install torch (CPU only)
+      - name: 📦 Install torch
         run: |
-          pip install --no-cache-dir torch==2.3.1 \
-            --index-url https://download.pytorch.org/whl/cpu
-          echo "=== RAM sau khi install torch ==="
+          pip install --no-cache-dir torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+          echo "=== RAM sau torch ==="
           free -h
 
       - name: 📦 Install other deps
         run: |
           pip install --no-cache-dir packaging safetensors spandrel pnnx
-          echo "=== RAM sau khi install deps ==="
+          echo "=== RAM sau deps ==="
           free -h
 
-      # ─────────────────────────────────────────────
-      # STEP 3: Download model
-      # ─────────────────────────────────────────────
       - name: ⬇️ Download PTH
         run: |
           wget -q -O model.pth \
             https://github.com/Phhofm/models/releases/download/2xPublic_realplksr_dysample_layernorm_real/2xPublic_realplksr_dysample_layernorm_real.pth
           ls -lh model.pth
-          echo "=== RAM sau download ==="
           free -h
 
-      # ─────────────────────────────────────────────
-      # STEP 4: Load model — in RAM
-      # ─────────────────────────────────────────────
-      - name: 🔍 Debug: Load model only
+      - name: 🔍 Debug Load model
         shell: python
         run: |
-          import gc, torch
+          import gc, torch, subprocess
           from spandrel import ModelLoader
-          import subprocess
 
-          def ram():
+          def ram(label=""):
+              print(f"=== RAM {label} ===")
               subprocess.run(["free", "-h"])
 
-          print("=== RAM trước load ==="); ram()
+          ram("before load")
           arch = ModelLoader().load_from_file("model.pth")
           model = arch.model.eval()
-          print("=== RAM sau load model ==="); ram()
-
-          # Đếm params
+          ram("after load")
           total = sum(p.numel() for p in model.parameters())
           print(f"Model params: {total:,} ({total*4/1e6:.1f} MB fp32)")
 
-      # ─────────────────────────────────────────────
-      # STEP 5: Thử trace từng size, in RAM sau mỗi bước
-      # ─────────────────────────────────────────────
-      - name: 🔍 Debug: Trace model
+      - name: 🔍 Debug Trace model
         shell: python
         env:
           TILE_SIZE: ${{ inputs.tile_size }}
         run: |
-          import os, gc, torch
+          import os, gc, torch, subprocess
           from spandrel import ModelLoader
-          import subprocess
 
           def ram(label=""):
               print(f"=== RAM {label} ===")
               subprocess.run(["free", "-h"])
 
           tile = int(os.environ["TILE_SIZE"])
-          print(f"▶ Tile size: {tile}x{tile}")
+          print(f"Tile: {tile}x{tile}")
 
           ram("before load")
           arch = ModelLoader().load_from_file("model.pth")
@@ -123,64 +100,49 @@ jobs:
           ram("after load")
 
           dummy = torch.zeros(1, 3, tile, tile)
-          ram(f"after create dummy {tile}x{tile}")
+          ram(f"after dummy {tile}x{tile}")
 
-          print("▶ Warm-up forward pass...")
+          print("Warm-up...")
           with torch.no_grad():
               out = model(dummy)
           print(f"Output shape: {out.shape}")
           del out
           gc.collect()
-          ram("after warm-up + gc")
+          ram("after warm-up")
 
-          print("▶ JIT trace...")
+          print("JIT trace...")
           with torch.no_grad():
               traced = torch.jit.trace(model, dummy)
           del model
           gc.collect()
-          ram("after trace + gc")
+          ram("after trace")
 
-          print("▶ Save model.pt...")
+          print("Save model.pt...")
           traced.save("model.pt")
           del traced
           gc.collect()
-          ram("after save + gc")
+          ram("after save")
+          print(f"model.pt size: {os.path.getsize('model.pt')/1e6:.1f} MB")
 
-          import os as _os
-          print(f"model.pt size: {_os.path.getsize('model.pt')/1e6:.1f} MB")
-
-      # ─────────────────────────────────────────────
-      # STEP 6: PNNX convert — chạy riêng để isolate
-      # ─────────────────────────────────────────────
-      - name: 🔍 Debug: PNNX convert
-        env:
-          TILE_SIZE: ${{ inputs.tile_size }}
+      - name: 🔍 Debug PNNX convert
         run: |
-          TILE=${{ inputs.tile_size }}
-          echo "=== RAM trước PNNX ==="
+          TILE="${{ inputs.tile_size }}"
+          echo "=== RAM before PNNX ==="
           free -h
-          echo "▶ Running PNNX..."
+          echo "Running PNNX tile=${TILE}..."
 
-          # Chạy PNNX với timeout 10 phút để tránh bị cancel ngầm
-          timeout 600 pnnx model.pt \
-            inputshape=[1,3,${TILE},${TILE}] \
-            fp16=1 \
-          && echo "✅ PNNX OK" \
-          || { echo "❌ PNNX failed/timeout"; free -h; ls -lh; exit 1; }
+          SHAPE="[1,3,${TILE},${TILE}]"
+          timeout 600 pnnx model.pt "inputshape=${SHAPE}" fp16=1 \
+            && echo "PNNX OK" \
+            || { echo "PNNX FAILED"; free -h; ls -lh; exit 1; }
 
-          echo "=== RAM sau PNNX ==="
+          echo "=== RAM after PNNX ==="
           free -h
-          echo "=== Files ==="
           ls -lh
 
-      # ─────────────────────────────────────────────
-      # STEP 7: Rename + upload
-      # ─────────────────────────────────────────────
       - name: 📦 Rename outputs
-        env:
-          TILE_SIZE: ${{ inputs.tile_size }}
         run: |
-          TILE=${{ inputs.tile_size }}
+          TILE="${{ inputs.tile_size }}"
           OUTNAME="2xPublic_realplksr_dysample_layernorm_real_${TILE}x${TILE}"
           mv model.ncnn.param "${OUTNAME}.ncnn.param"
           mv model.ncnn.bin   "${OUTNAME}.ncnn.bin"
@@ -189,7 +151,7 @@ jobs:
       - name: 📤 Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: realplksr-${{ inputs.tile_size }}-ncnn
+          name: "realplksr-${{ inputs.tile_size }}-ncnn"
           path: |
             *.ncnn.param
             *.ncnn.bin
