@@ -18,9 +18,14 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install torch torchvision onnx onnxsim spandrel
+          # Đã thêm 'packaging' vào đây
+          pip install torch torchvision onnx onnxsim spandrel packaging
 
-      - name: Download Safetensors & Export STATIC SHAPE ONNX
+      - name: Download Model
+        run: |
+          wget -O model.safetensors "https://github.com/Phhofm/models/releases/download/2xParagonSR_Nano_gan/2xParagonSR_Nano_gan_fused.safetensors"
+
+      - name: Export STATIC SHAPE ONNX
         run: |
           python - <<EOF
           import torch
@@ -31,7 +36,7 @@ jobs:
           model.eval()
 
           print("Đang xuất ONNX với Static Shape (CỐ ĐỊNH input)...")
-          # QUAN TRỌNG: Ép cứng dummy_input là 1x3x64x64. Không để kích thước động.
+          # Ép cứng dummy_input là 1x3x64x64 để triệt tiêu MemoryData
           dummy_input = torch.randn(1, 3, 64, 64)
 
           torch.onnx.export(
@@ -41,7 +46,6 @@ jobs:
               opset_version=14,
               input_names=["input"], 
               output_names=["output"],
-              # KHÔNG có tham số dynamic_axes ở đây!
           )
           print("Đã xuất file ONNX thành công!")
           EOF
