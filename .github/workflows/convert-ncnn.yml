@@ -1,54 +1,24 @@
-name: Convert 1x Model to NCNN
+name: Convert 1xDeNoise_realplksr_otf to NCNN
 
 on:
   workflow_dispatch:
     inputs:
-      model_url:
-        description: 'Direct download URL (.pth or .onnx)'
-        required: true
-        default: 'https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf.onnx'
-      output_name:
-        description: 'Output filename (no extension)'
-        required: true
-        default: '1xDeNoise_realplksr_otf'
-      input_format:
-        description: 'Input format: onnx or pth'
+      source_format:
+        description: 'Chọn file nguồn để convert?'
         required: true
         default: 'onnx'
         type: choice
         options:
           - onnx
           - pth
-      # ── PTH → ONNX params (chỉ dùng khi input_format=pth) ──
-      dim:
-        description: '[PTH only] Model dim (0=auto)'
-        required: true
-        default: '0'
-      n_blocks:
-        description: '[PTH only] Number of PLK blocks (0=auto)'
-        required: true
-        default: '0'
-      kernel_size:
-        description: '[PTH only] Kernel size (0=auto)'
-        required: true
-        default: '0'
-      onnx_input_shape:
-        description: 'ONNX export input shape B,C,H,W'
-        required: true
-        default: '1,3,256,256'
-      # ── NCNN options ──
-      simplify_onnx:
-        description: 'Simplify ONNX before convert? (true/false)'
-        required: true
-        default: 'true'
       fp16:
-        description: 'Store NCNN weights as FP16? (true/false)'
+        description: 'Nén weights sang FP16? (Giảm 50% dung lượng)'
         required: true
         default: 'true'
-      quantize_int8:
-        description: 'Quantize to INT8? (true/false)'
-        required: true
-        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   convert:
@@ -69,245 +39,126 @@ jobs:
       # ─────────────────── Install Python deps ───────────────────
       - name: 📦 Install Python dependencies
         run: |
-          # PyTorch CPU only (nhẹ hơn, đủ cho convert)
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          # Còn lại từ requirements.txt
           pip install -r requirements.txt
 
       # ─────────────────── Build NCNN tools ───────────────────
       - name: 🔨 Build NCNN (onnx2ncnn, ncnnoptimize)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq build-essential cmake git
-
           git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git /tmp/ncnn
-
           mkdir -p /tmp/ncnn/build && cd /tmp/ncnn/build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNCNN_BUILD_TOOLS=ON \
-            -DNCNN_BUILD_EXAMPLES=OFF \
-            -DNCNN_BUILD_TESTS=OFF \
-            -DNCNN_PYTHON=OFF \
-            -DNCNN_VULKAN=OFF
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TESTS=OFF -DNCNN_PYTHON=OFF -DNCNN_VULKAN=OFF
           cmake --build . -j$(nproc)
-
-          # Verify
-          /tmp/ncnn/build/tools/onnx/onnx2ncnn --help 2>&1 || true
           echo "✅ NCNN tools built"
 
       # ─────────────────── Download Model ───────────────────
-      - name: ⬇️ Download model
+      - name: ⬇️ Download source model
         run: |
-          URL="${{ github.event.inputs.model_url }}"
-          EXT="${{ github.event.inputs.input_format }}"
-          wget -q "$URL" -O "input_model.${EXT}"
-          ls -lh "input_model.${EXT}"
+          if [ "${{ github.event.inputs.source_format }}" == "onnx" ]; then
+            URL="https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf_fp32.onnx"
+            FILENAME="model.onnx"
+          else
+            URL="https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf.pth"
+            FILENAME="model.pth"
+          fi
+          echo "⬇️ Downloading: $URL"
+          wget -q "$URL" -O "$FILENAME"
+          ls -lh "$FILENAME"
 
       # ─────────────────── PTH → ONNX (if needed) ───────────────────
       - name: 🔄 Convert PTH → ONNX
-        if: github.event.inputs.input_format == 'pth'
+        if: github.event.inputs.source_format == 'pth'
         run: |
           python scripts/convert_helpers.py \
-            --input input_model.pth \
+            --input model.pth \
             --output model.onnx \
-            --dim ${{ github.event.inputs.dim }} \
-            --n_blocks ${{ github.event.inputs.n_blocks }} \
-            --kernel_size ${{ github.event.inputs.kernel_size }} \
-            --input_shape "${{ github.event.inputs.onnx_input_shape }}"
-
-      - name: 📋 Rename ONNX (if input was onnx)
-        if: github.event.inputs.input_format == 'onnx'
-        run: |
-          cp input_model.onnx model.onnx
+            --input_shape 1,3,256,256
 
       # ─────────────────── Simplify ONNX ───────────────────
       - name: ✂️ Simplify ONNX
-        if: github.event.inputs.simplify_onnx == 'true'
         run: |
           python -c "
           import onnx
           from onnxsim import simplify
 
-          print('Loading ONNX model...')
           model = onnx.load('model.onnx')
-          print(f'  Inputs:  {[i.name for i in model.graph.input]}')
-          print(f'  Outputs: {[o.name for o in model.graph.output]}')
-
-          # Get input shapes for shape inference
           input_shapes = {}
           for inp in model.graph.input:
               shape = [d.dim_value if d.dim_value else 1 for d in inp.type.tensor_type.shape.dim]
               input_shapes[inp.name] = shape
-          print(f'  Input shapes: {input_shapes}')
 
-          print('Simplifying...')
           model_simp, check = simplify(model, input_shapes=input_shapes)
           assert check, 'Simplified ONNX model could not be validated'
           onnx.save(model_simp, 'model_simplified.onnx')
-          print('✅ Simplified ONNX saved')
 
           import os
-          orig = os.path.getsize('model.onnx') / 1024 / 1024
-          simp = os.path.getsize('model_simplified.onnx') / 1024 / 1024
-          print(f'  Original:    {orig:.2f} MB')
-          print(f'  Simplified:  {simp:.2f} MB')
+          simp_size = os.path.getsize('model_simplified.onnx') / 1024 / 1024
+          print(f'✅ Simplified ONNX saved ({simp_size:.2f} MB)')
           "
           mv model_simplified.onnx model.onnx
 
       # ─────────────────── ONNX → NCNN ───────────────────
       - name: 🔄 Convert ONNX → NCNN
         run: |
-          OUTPUT="${{ github.event.inputs.output_name }}"
-
-          # onnx2ncnn produces .param and .bin
-          /tmp/ncnn/build/tools/onnx/onnx2ncnn \
-            model.onnx \
-            "${OUTPUT}.param" \
-            "${OUTPUT}.bin"
-
-          echo "✅ onnx2ncnn conversion done"
-          ls -lh "${OUTPUT}.param" "${OUTPUT}.bin"
+          /tmp/ncnn/build/tools/onnx/onnx2ncnn model.onnx 1xDeNoise_realplksr_otf.param 1xDeNoise_realplksr_otf.bin
+          echo "✅ onnx2ncnn done"
+          ls -lh 1xDeNoise_realplksr_otf.param 1xDeNoise_realplksr_otf.bin
 
       # ─────────────────── NCNN Optimize (FP16) ───────────────────
       - name: ⚡ Optimize NCNN (FP16)
         if: github.event.inputs.fp16 == 'true'
         run: |
-          OUTPUT="${{ github.event.inputs.output_name }}"
-
           /tmp/ncnn/build/tools/ncnnoptimize \
-            "${OUTPUT}.param" \
-            "${OUTPUT}.bin" \
-            "${OUTPUT}_opt.param" \
-            "${OUTPUT}_opt.bin" \
+            1xDeNoise_realplksr_otf.param \
+            1xDeNoise_realplksr_otf.bin \
+            1xDeNoise_realplksr_otf_opt.param \
+            1xDeNoise_realplksr_otf_opt.bin \
             65536
 
-          # Replace with optimized version
-          mv "${OUTPUT}_opt.param" "${OUTPUT}.param"
-          mv "${OUTPUT}_opt.bin" "${OUTPUT}.bin"
-
+          mv 1xDeNoise_realplksr_otf_opt.param 1xDeNoise_realplksr_otf.param
+          mv 1xDeNoise_realplksr_otf_opt.bin 1xDeNoise_realplksr_otf.bin
           echo "✅ ncnnoptimize (FP16) done"
-          ls -lh "${OUTPUT}.param" "${OUTPUT}.bin"
-
-      # ─────────────────── INT8 Quantization (optional) ───────────────────
-      - name: 📊 INT8 Quantization
-        if: github.event.inputs.quantize_int8 == 'true'
-        run: |
-          OUTPUT="${{ github.event.inputs.output_name }}"
-
-          # Generate calibration data (random images for structure)
-          python -c "
-          import numpy as np
-          import os
-          os.makedirs('calibration', exist_ok=True)
-          # Create 50 random calibration images
-          for i in range(50):
-              data = np.random.rand(3, 256, 256).astype(np.float32)
-              data.tofile(f'calibration/img_{i}.bin')
-          with open('calibration.txt', 'w') as f:
-              for i in range(50):
-                  f.write(f'calibration/img_{i}.bin\n')
-          print('Calibration data generated')
-          "
-
-          # Find mean and norm values from input
-          # For 0-1 range: mean=[0,0,0] norm=[1,1,1]
-          # For 0-255 range: mean=[127.5,127.5,127.5] norm=[0.007843,0.007843,0.007843]
-
-          # Create ncnn2table config
-          cat > quantize.yml << 'EOF'
-          prepipeline:
-          pipeline:
-            - type: resize
-              size: [256, 256]
-            - type: normalize
-              mean: [0, 0, 0]
-              std: [1, 1, 1]
-          EOF
-
-          # Run ncnn2table
-          /tmp/ncnn/build/tools/quantize/ncnn2table \
-            "${OUTPUT}.param" \
-            "${OUTPUT}.bin" \
-            calibration.txt \
-            "${OUTPUT}.table" \
-            quantize.yml \
-            256 256 || true
-
-          # Run ncnn2int8
-          if [ -f "${OUTPUT}.table" ]; then
-            /tmp/ncnn/build/tools/quantize/ncnn2int8 \
-              "${OUTPUT}.param" \
-              "${OUTPUT}.bin" \
-              "${OUTPUT}_int8.param" \
-              "${OUTPUT}_int8.bin" \
-              "${OUTPUT}.table"
-
-            mv "${OUTPUT}_int8.param" "${OUTPUT}.param"
-            mv "${OUTPUT}_int8.bin" "${OUTPUT}.bin"
-            echo "✅ INT8 quantization done"
-          else
-            echo "⚠️ Calibration table not generated, skipping INT8"
-          fi
-
-          ls -lh "${OUTPUT}.param" "${OUTPUT}.bin"
+          ls -lh 1xDeNoise_realplksr_otf.param 1xDeNoise_realplksr_otf.bin
 
       # ─────────────────── Verify NCNN inference ───────────────────
       - name: 🧪 Verify NCNN model
         run: |
-          pip install ncnn 2>/dev/null || true
-
           python -c "
           import ncnn
           import numpy as np
 
-          OUTPUT = '${{ github.event.inputs.output_name }}'
-
-          print('🔍 Verifying NCNN model...')
-
-          # Load model
           net = ncnn.Net()
-          net.load_param(f'{OUTPUT}.param')
-          net.load_model(f'{OUTPUT}.bin')
+          net.load_param('1xDeNoise_realplksr_otf.param')
+          net.load_model('1xDeNoise_realplksr_otf.bin')
 
-          # Create input
-          h, w = 256, 256
-          mat_in = ncnn.Mat.from_numpy(np.random.rand(3, h, w).astype(np.float32))
-
-          # Inference
+          mat_in = ncnn.Mat.from_numpy(np.random.rand(3, 256, 256).astype(np.float32))
           ex = net.create_extractor()
           ex.input('input', mat_in)
           ret, mat_out = ex.extract('output')
 
           if ret == 0:
-              print(f'  ✅ NCNN inference OK')
-              print(f'  Input:  3x{h}x{w}')
-              print(f'  Output: {mat_out.c}x{mat_out.h}x{mat_out.w}')
+              print(f'✅ NCNN inference OK! Output: {mat_out.c}x{mat_out.h}x{mat_out.w}')
           else:
-              print(f'  ❌ NCNN inference failed (ret={ret})')
-          " 2>/dev/null || echo "⚠️ ncnn python binding not available for verification, but .param/.bin files are valid"
+              print(f'❌ NCNN inference failed (ret={ret})')
+          "
 
       # ─────────────────── Upload Artifacts ───────────────────
       - name: 📤 Upload NCNN model
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.output_name }}-ncnn
+          name: 1xDeNoise_realplksr_otf-ncnn
           path: |
-            ${{ github.event.inputs.output_name }}.param
-            ${{ github.event.inputs.output_name }}.bin
+            1xDeNoise_realplksr_otf.param
+            1xDeNoise_realplksr_otf.bin
           retention-days: 30
 
       # ─────────────────── Summary ───────────────────
       - name: 📋 Summary
         if: always()
         run: |
-          OUTPUT="${{ github.event.inputs.output_name }}"
           echo "========================================="
           echo "  NCNN CONVERSION SUMMARY"
           echo "========================================="
-          for f in ${OUTPUT}.param ${OUTPUT}.bin model.onnx; do
-            if [ -f "$f" ]; then
-              SIZE=$(du -h "$f" | cut -f1)
-              echo "  ✅ $f ($SIZE)"
-            fi
-          done
+          ls -lh 1xDeNoise_realplksr_otf.param 1xDeNoise_realplksr_otf.bin 2>/dev/null
           echo "========================================="
