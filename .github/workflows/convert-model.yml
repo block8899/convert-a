@@ -1,4 +1,4 @@
-name: Convert RealPLKSR Model to PTH/ONNX
+name: Convert 1xDeNoise_realplksr_otf Model to PTH/ONNX
 
 on:
   workflow_dispatch:
