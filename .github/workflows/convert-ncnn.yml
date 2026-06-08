@@ -1,0 +1,203 @@
+name: Convert 1xDenoise Model to NCNN
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: 'Direct download URL (.pth or .onnx)'
+        required: true
+        default: 'https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf.onnx'
+      output_name:
+        description: 'Output filename (no extension)'
+        required: true
+        default: '1xDeNoise_realplksr_otf'
+      input_format:
+        description: 'Input format: onnx or pth'
+        required: true
+        default: 'onnx'
+        type: choice
+        options:
+          - onnx
+          - pth
+      # ── PTH → ONNX params (chỉ dùng khi input_format=pth) ──
+      dim:
+        description: '[PTH only] Model dim (0=auto)'
+        required: true
+        default: '0'
+      n_blocks:
+        description: '[PTH only] Number of PLK blocks (0=auto)'
+        required: true
+        default: '0'
+      kernel_size:
+        description: '[PTH only] Kernel size (0=auto)'
+        required: true
+        default: '0'
+      onnx_input_shape:
+        description: 'ONNX export input shape B,C,H,W'
+        required: true
+        default: '1,3,256,256'
+      # ── NCNN options ──
+      simplify_onnx:
+        description: 'Simplify ONNX before convert? (true/false)'
+        required: true
+        default: 'true'
+      fp16:
+        description: 'Store NCNN weights as FP16? (true/false)'
+        required: true
+        default: 'true'
+      quantize_int8:
+        description: 'Quantize to INT8? (true/false)'
+        required: true
+        default: 'false'
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─────────────────── Checkout ───────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────── Python Setup ───────────────────
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ─────────────────── Install Python deps ───────────────────
+      - name: 📦 Install Python dependencies
+        run: |
+          pip install onnx onnxruntime onnxsim numpy
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      # ─────────────────── Build NCNN tools ───────────────────
+      - name: 🔨 Build NCNN (onnx2ncnn, ncnnoptimize)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq build-essential cmake git
+
+          git clone --depth 1 --recursive https://github.com/Tencent/ncnn.git /tmp/ncnn
+
+          mkdir -p /tmp/ncnn/build && cd /tmp/ncnn/build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNCNN_BUILD_TOOLS=ON \
+            -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_PYTHON=OFF \
+            -DNCNN_VULKAN=OFF
+          cmake --build . -j$(nproc)
+
+          # Verify
+          /tmp/ncnn/build/tools/onnx/onnx2ncnn --help 2>&1 || true
+          echo "✅ NCNN tools built"
+
+      # ─────────────────── Download Model ───────────────────
+      - name: ⬇️ Download model
+        run: |
+          URL="${{ github.event.inputs.model_url }}"
+          EXT="${{ github.event.inputs.input_format }}"
+          wget -q "$URL" -O "input_model.${EXT}"
+          ls -lh "input_model.${EXT}"
+
+      # ─────────────────── PTH → ONNX (if needed) ───────────────────
+      - name: 🔄 Convert PTH → ONNX
+        if: github.event.inputs.input_format == 'pth'
+        run: |
+          python scripts/convert_helpers.py \
+            --input input_model.pth \
+            --output model.onnx \
+            --dim ${{ github.event.inputs.dim }} \
+            --n_blocks ${{ github.event.inputs.n_blocks }} \
+            --kernel_size ${{ github.event.inputs.kernel_size }} \
+            --input_shape "${{ github.event.inputs.onnx_input_shape }}"
+
+      - name: 📋 Rename ONNX (if input was onnx)
+        if: github.event.inputs.input_format == 'onnx'
+        run: |
+          cp input_model.onnx model.onnx
+
+      # ─────────────────── Simplify ONNX ───────────────────
+      - name: ✂️ Simplify ONNX
+        if: github.event.inputs.simplify_onnx == 'true'
+        run: |
+          python -c "
+          import onnx
+          from onnxsim import simplify
+
+          print('Loading ONNX model...')
+          model = onnx.load('model.onnx')
+          print(f'  Inputs:  {[i.name for i in model.graph.input]}')
+          print(f'  Outputs: {[o.name for o in model.graph.output]}')
+
+          # Get input shapes for shape inference
+          input_shapes = {}
+          for inp in model.graph.input:
+              shape = [d.dim_value if d.dim_value else 1 for d in inp.type.tensor_type.shape.dim]
+              input_shapes[inp.name] = shape
+          print(f'  Input shapes: {input_shapes}')
+
+          print('Simplifying...')
+          model_simp, check = simplify(model, input_shapes=input_shapes)
+          assert check, 'Simplified ONNX model could not be validated'
+          onnx.save(model_simp, 'model_simplified.onnx')
+          print('✅ Simplified ONNX saved')
+
+          import os
+          orig = os.path.getsize('model.onnx') / 1024 / 1024
+          simp = os.path.getsize('model_simplified.onnx') / 1024 / 1024
+          print(f'  Original:    {orig:.2f} MB')
+          print(f'  Simplified:  {simp:.2f} MB')
+          "
+          mv model_simplified.onnx model.onnx
+
+      # ─────────────────── ONNX → NCNN ───────────────────
+      - name: 🔄 Convert ONNX → NCNN
+        run: |
+          OUTPUT="${{ github.event.inputs.output_name }}"
+
+          # onnx2ncnn produces .param and .bin
+          /tmp/ncnn/build/tools/onnx/onnx2ncnn \
+            model.onnx \
+            "${OUTPUT}.param" \
+            "${OUTPUT}.bin"
+
+          echo "✅ onnx2ncnn conversion done"
+          ls -lh "${OUTPUT}.param" "${OUTPUT}.bin"
+
+      # ─────────────────── NCNN Optimize (FP16) ───────────────────
+      - name: ⚡ Optimize NCNN (FP16)
+        if: github.event.inputs.fp16 == 'true'
+        run: |
+          OUTPUT="${{ github.event.inputs.output_name }}"
+
+          /tmp/ncnn/build/tools/ncnnoptimize \
+            "${OUTPUT}.param" \
+            "${OUTPUT}.bin" \
+            "${OUTPUT}_opt.param" \
+            "${OUTPUT}_opt.bin" \
+            65536
+
+          # Replace with optimized version
+          mv "${OUTPUT}_opt.param" "${OUTPUT}.param"
+          mv "${OUTPUT}_opt.bin" "${OUTPUT}.bin"
+
+          echo "✅ ncnnoptimize (FP16) done"
+          ls -lh "${OUTPUT}.param" "${OUTPUT}.bin"
+
+      # ─────────────────── INT8 Quantization (optional) ───────────────────
+      - name: 📊 INT8 Quantization
+        if: github.event.inputs.quantize_int8 == 'true'
+        run: |
+          OUTPUT="${{ github.event.inputs.output_name }}"
+
+          # Generate calibration data (random images for structure)
+          python -c "
+          import numpy as np
+          import os
+          os.makedirs('calibration', exist_ok=True)
+          # Create 50 random calibration images
+          for i in range(50):
+              data = np.random.rand(3, 256, 256).astype(np.float32)
+              data.tofile(f'calibration/img_{
