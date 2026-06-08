@@ -1,0 +1,135 @@
+name: Convert RealPLKSR Model to PTH/ONNX
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: 'Direct download URL for model weights'
+        required: true
+        default: 'https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf.pth'
+      output_name:
+        description: 'Output filename (no extension)'
+        required: true
+        default: '1xDeNoise_realplksr_otf'
+      dim:
+        description: 'Model dim (0 = auto-detect)'
+        required: true
+        default: '0'
+      n_blocks:
+        description: 'Number of PLK blocks (0 = auto-detect)'
+        required: true
+        default: '0'
+      kernel_size:
+        description: 'Kernel size (0 = auto-detect)'
+        required: true
+        default: '0'
+      onnx_input_shape:
+        description: 'ONNX export input shape (B,C,H,W)'
+        required: true
+        default: '1,3,256,256'
+      export_onnx:
+        description: 'Export ONNX? (true/false)'
+        required: true
+        default: 'true'
+      export_pth:
+        description: 'Export clean PTH? (true/false)'
+        required: true
+        default: 'true'
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ─────────────────────── Checkout ───────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────── Python Setup ───────────────────────
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ─────────────────────── Dependencies ───────────────────────
+      - name: 📦 Install dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx onnxruntime safetensors numpy
+
+      # ─────────────────────── Clone Architecture Source ───────────────────────
+      - name: 🏗️ Clone architecture source repo
+        run: |
+          git clone --depth 1 https://github.com/phhofm/practical-models-for-image-restoration.git arch_source 2>/dev/null || true
+          echo "Arch source cloned: $(ls arch_source/ 2>/dev/null | head -5)"
+
+      # ─────────────────────── Download Model ───────────────────────
+      - name: ⬇️ Download model weights
+        run: |
+          wget -q "${{ github.event.inputs.model_url }}" -O downloaded_weights.pth
+          echo "✅ Downloaded:"
+          ls -lh downloaded_weights.pth
+          echo "---"
+          python -c "
+          import torch
+          ckpt = torch.load('downloaded_weights.pth', map_location='cpu', weights_only=False)
+          if isinstance(ckpt, dict):
+              print('Checkpoint type: dict')
+              print('Top-level keys:', list(ckpt.keys())[:20])
+              for k, v in ckpt.items():
+                  if isinstance(v, dict):
+                      print(f'  [{k}] sub-keys ({len(v)}):', list(v.keys())[:10])
+                  elif isinstance(v, torch.Tensor):
+                      print(f'  [{k}] tensor shape:', v.shape)
+                  else:
+                      print(f'  [{k}] type:', type(v).__name__)
+          else:
+              print('Checkpoint type:', type(ckpt).__name__)
+          "
+
+      # ─────────────────────── Convert ───────────────────────
+      - name: 🔄 Run conversion
+        run: |
+          python scripts/convert_model.py \
+            --input downloaded_weights.pth \
+            --output_name "${{ github.event.inputs.output_name }}" \
+            --arch_source arch_source \
+            --dim ${{ github.event.inputs.dim }} \
+            --n_blocks ${{ github.event.inputs.n_blocks }} \
+            --kernel_size ${{ github.event.inputs.kernel_size }} \
+            --onnx_input_shape "${{ github.event.inputs.onnx_input_shape }}" \
+            --export_onnx ${{ github.event.inputs.export_onnx }} \
+            --export_pth ${{ github.event.inputs.export_pth }}
+
+      # ─────────────────────── Upload Artifacts ───────────────────────
+      - name: 📤 Upload PTH artifact
+        if: github.event.inputs.export_pth == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_name }}-pth
+          path: ${{ github.event.inputs.output_name }}.pth
+          retention-days: 30
+
+      - name: 📤 Upload ONNX artifact
+        if: github.event.inputs.export_onnx == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_name }}-onnx
+          path: ${{ github.event.inputs.output_name }}.onnx
+          retention-days: 30
+
+      # ─────────────────────── Summary ───────────────────────
+      - name: 📋 Conversion summary
+        if: always()
+        run: |
+          echo "========================================="
+          echo "  CONVERSION SUMMARY"
+          echo "========================================="
+          for f in ${{ github.event.inputs.output_name }}.*; do
+            if [ -f "$f" ]; then
+              SIZE=$(du -h "$f" | cut -f1)
+              echo "  ✅ $f ($SIZE)"
+            fi
+          done
+          echo "========================================="
