@@ -1,71 +1,3 @@
-name: Convert 1xDeNoise_realplksr_otf to NCNN
-
-on:
-  workflow_dispatch:
-    inputs:
-      source:
-        description: 'Nguồn convert?'
-        required: true
-        default: 'onnx'
-        type: choice
-        options:
-          - onnx
-          - pth
-      fp16:
-        description: 'FP16? (true/false)'
-        required: true
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-
-jobs:
-  convert:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      # ─── Fast path: ONNX only, không cần PyTorch ───
-      - name: Install deps (ONNX path)
-        if: github.event.inputs.source == 'onnx'
-        run: |
-          pip install onnx onnxsim onnx-graphsurgeon packaging
-
-      # ─── Slow path: PTH cần PyTorch ───
-      - name: Install deps (PTH path)
-        if: github.event.inputs.source == 'pth'
-        run: |
-          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install onnx onnxsim onnx-graphsurgeon packaging
-
-      # ─── Download ───
-      - name: Download model (ONNX)
-        if: github.event.inputs.source == 'onnx'
-        run: |
-          wget -O model_original.onnx "https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf_fp32.onnx"
-
-      - name: Download model (PTH)
-        if: github.event.inputs.source == 'pth'
-        run: |
-          wget -O model.pth "https://github.com/Phhofm/models/releases/download/1xDeNoise_realplksr_otf/1xDeNoise_realplksr_otf.pth"
-
-      # ─── PTH → ONNX (chỉ khi chọn PTH) ───
-      - name: Convert PTH → ONNX
-        if: github.event.inputs.source == 'pth'
-        run: |
-          python scripts/convert_helpers.py \
-            --input model.pth \
-            --output model_original.onnx
-
-      # ─── Force Static Shape & Simplify ───
       - name: Force Static Input Shape & Simplify
         run: |
           python - <<EOF
@@ -74,9 +6,10 @@ jobs:
           from onnxsim import simplify
 
           print("Loading ONNX...")
-          graph = og.import_onnx("model_original.onnx")
+          onnx_model = onnx.load("model_original.onnx")    # ← load trước
+          graph = og.import_onnx(onnx_model)               # ← truyền object, KHÔNG phải string
 
-          # Ép static shape — quan trọng để triệt tiêu MemoryData trong NCNN
+          # Ép static shape — triệt tiêu MemoryData trong NCNN
           for inp in graph.inputs:
               print(f"  Input: {inp.name}, shape cũ: {inp.shape}")
               inp.shape = [1, 3, 256, 256]
@@ -96,37 +29,3 @@ jobs:
               print("⚠️ Simplify lỗi, dùng file static.")
               onnx.save(model, "model_sim.onnx")
           EOF
-
-      # ─── Build onnx2ncnn & ncnnoptimize ───
-      - name: Install onnx2ncnn & ncnnoptimize
-        run: |
-          sudo apt-get update && sudo apt-get install -y cmake
-          git clone https://github.com/Tencent/ncnn.git
-          cd ncnn
-          mkdir build && cd build
-          cmake .. -DONNX2NCNN=ON
-          make -j$(nproc) onnx2ncnn ncnnoptimize
-          sudo cp onnx2ncnn /usr/local/bin/
-          sudo cp ncnnoptimize /usr/local/bin/
-
-      # ─── Convert to NCNN & Optimize ───
-      - name: Convert to NCNN
-        run: |
-          onnx2ncnn model_sim.onnx 1xDeNoise_realplksr_otf.param 1xDeNoise_realplksr_otf.bin
-
-      - name: Optimize NCNN (FP16)
-        if: github.event.inputs.fp16 == 'true'
-        run: |
-          ncnnoptimize 1xDeNoise_realplksr_otf.param 1xDeNoise_realplksr_otf.bin 1xDeNoise_realplksr_otf_opt.param 1xDeNoise_realplksr_otf_opt.bin 65536
-          mv 1xDeNoise_realplksr_otf_opt.param 1xDeNoise_realplksr_otf.param
-          mv 1xDeNoise_realplksr_otf_opt.bin 1xDeNoise_realplksr_otf.bin
-
-      # ─── Upload ───
-      - name: Upload NCNN Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: 1xDeNoise_realplksr_otf-ncnn
-          path: |
-            1xDeNoise_realplksr_otf.param
-            1xDeNoise_realplksr_otf.bin
-          retention-days: 7
