@@ -1,0 +1,15 @@
+# ── Core ──
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+
+# ── ONNX ──
+onnx>=1.15.0
+onnxruntime>=1.16.0
+onnxsim>=0.4.35
+
+# ── NCNN Python binding (verification only) ──
+ncnn>=1.0.0
+
+# ── SafeTensors (for .safetensors model files) ──
+safetensors>=0.4.0
