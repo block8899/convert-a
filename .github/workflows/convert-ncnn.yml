@@ -69,8 +69,10 @@ jobs:
       # ─────────────────── Install Python deps ───────────────────
       - name: 📦 Install Python dependencies
         run: |
-          pip install onnx onnxruntime onnxsim numpy
+          # PyTorch CPU only (nhẹ hơn, đủ cho convert)
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          # Còn lại từ requirements.txt
+          pip install -r requirements.txt
 
       # ─────────────────── Build NCNN tools ───────────────────
       - name: 🔨 Build NCNN (onnx2ncnn, ncnnoptimize)
